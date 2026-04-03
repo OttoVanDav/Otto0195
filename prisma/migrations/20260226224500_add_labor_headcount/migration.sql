@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "LaborPool"
+ADD COLUMN "headcount" INTEGER NOT NULL DEFAULT 1;

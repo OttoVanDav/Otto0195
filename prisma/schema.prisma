@@ -1,0 +1,499 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "darwin", "darwin-arm64"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OutletType {
+  BAR
+  RESTAURANT
+}
+
+enum StockMoveType {
+  TRANSFER_TO_OUTLET
+  ADJUSTMENT_PLUS
+  ADJUSTMENT_MINUS
+}
+
+enum LaborPoolType {
+  BAR_POOL
+  DIRECT
+}
+
+model Org {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+
+  properties  Property[]
+  fiscalYears FiscalYear[]
+  products    Product[]
+
+  externalMaps    ExternalProductMap[]
+  purchases       Purchase[]
+  stockMoves      StockMove[]
+  sales           Sale[]
+  inventoryCounts InventoryCount[]
+  laborPools      LaborPool[]
+}
+
+model FiscalYear {
+  id        String   @id @default(cuid())
+  orgId     String
+  year      Int
+  startDate DateTime
+  endDate   DateTime
+  createdAt DateTime @default(now())
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  purchases       Purchase[]
+  stockMoves      StockMove[]
+  sales           Sale[]
+  inventoryCounts InventoryCount[]
+  expenses        Expense[]
+  laborPools      LaborPool[]
+
+  @@unique([orgId, year], name: "orgId_year")
+  @@index([orgId])
+}
+
+model Property {
+  id        String   @id @default(cuid())
+  orgId     String
+  name      String
+  createdAt DateTime @default(now())
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  warehouse  Warehouse?
+  outlets    Outlet[]
+  expenses   Expense[]
+  laborPools LaborPool[]
+  suppliers  Supplier[]
+  doseSources DoseSourceConfig[]
+  dosePools   DosePool[]
+
+  @@index([orgId])
+}
+
+model Warehouse {
+  id         String   @id @default(cuid())
+  propertyId String   @unique
+  name       String   @default("Magazzino centrale")
+  createdAt  DateTime @default(now())
+
+  property Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  purchases  Purchase[]
+  stockMoves StockMove[]
+}
+
+model Outlet {
+  id         String     @id @default(cuid())
+  propertyId String
+  name       String
+  type       OutletType
+  createdAt  DateTime   @default(now())
+
+  property Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  stockMoves       StockMove[]
+  sales            Sale[]
+  inventoryCounts  InventoryCount[]
+  expenses         Expense[]
+  laborPools       LaborPool[]       @relation("DirectLaborOutlet") // ✅ FIX: era LaborPool?
+  laborAllocations LaborAllocation[]
+  productCosts     OutletProductCost[]
+  productPrices    OutletProductPrice[]
+
+  @@unique([propertyId, name])
+  @@index([propertyId])
+}
+
+model OutletProductCost {
+  id          String   @id @default(cuid())
+  outletId    String
+  productId   String
+  year        Int
+  supplierId  String?
+  unitCostNetMin Float
+  unitCostNetMax Float
+  unitCostNet Float
+  note        String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  outlet   Outlet    @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  product  Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  supplier Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+
+  @@index([outletId, productId, year])
+  @@index([outletId, productId, year, supplierId])
+  @@index([productId, year])
+  @@index([supplierId])
+}
+
+model Supplier {
+  id         String   @id @default(cuid())
+  propertyId String
+  name       String
+  createdAt  DateTime @default(now())
+
+  property Property            @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  outletCosts OutletProductCost[]
+
+  @@unique([propertyId, name])
+  @@index([propertyId])
+}
+
+model OutletProductPrice {
+  id           String   @id @default(cuid())
+  outletId     String
+  productId    String
+  year         Int
+  unitPriceNet Float
+  note         String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  outlet  Outlet  @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([outletId, productId, year])
+  @@index([productId, year])
+  @@index([outletId, year])
+}
+
+model Product {
+  id                String   @id @default(cuid())
+  orgId             String
+  name              String
+  sku               String?
+  uom               String   @default("PZ")
+  priceCategory     String   @default("STANDARD")
+  defaultSalePriceNet Float  @default(0)
+  trackShrinkageBar Boolean  @default(false)
+  createdAt         DateTime @default(now())
+
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  purchaseLines       PurchaseLine[]
+  stockMoveLines      StockMoveLine[]
+  saleLines           SaleLine[]
+  inventoryCountLines InventoryCountLine[]
+  externalMaps        ExternalProductMap[]
+  outletCosts         OutletProductCost[]
+  outletPrices        OutletProductPrice[]
+  doseSourceConfigs   DoseSourceConfig[] @relation("DoseSourceProduct")
+  doseSaleLinks       DoseSaleLink[]     @relation("DoseTargetProduct")
+  dosePoolSources     DosePoolSource[]   @relation("DosePoolSourceProduct")
+  dosePoolSaleLinks   DosePoolSaleLink[] @relation("DosePoolTargetProduct")
+
+  @@index([orgId])
+  @@index([orgId, name])
+}
+
+model DoseSourceConfig {
+  id              String   @id @default(cuid())
+  propertyId      String
+  sourceProductId String
+  dosesPerUnit    Float
+  note            String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  property      Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  sourceProduct Product  @relation("DoseSourceProduct", fields: [sourceProductId], references: [id], onDelete: Cascade)
+
+  saleLinks DoseSaleLink[]
+
+  @@unique([propertyId, sourceProductId])
+  @@index([propertyId])
+  @@index([sourceProductId])
+}
+
+model DoseSaleLink {
+  id            String   @id @default(cuid())
+  configId      String
+  targetProductId String
+  dosesPerSale  Float
+  note          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  config        DoseSourceConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+  targetProduct Product          @relation("DoseTargetProduct", fields: [targetProductId], references: [id], onDelete: Cascade)
+
+  @@unique([configId, targetProductId])
+  @@index([targetProductId])
+  @@index([configId])
+}
+
+model DosePool {
+  id             String   @id @default(cuid())
+  propertyId     String
+  name           String
+  note           String?
+  legacyConfigId String?  @unique
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  property Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  sources   DosePoolSource[]
+  saleLinks DosePoolSaleLink[]
+
+  @@unique([propertyId, name])
+  @@index([propertyId])
+}
+
+model DosePoolSource {
+  id              String   @id @default(cuid())
+  poolId          String
+  sourceProductId String
+  dosesPerUnit    Float
+  note            String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  pool          DosePool @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  sourceProduct Product  @relation("DosePoolSourceProduct", fields: [sourceProductId], references: [id], onDelete: Cascade)
+
+  @@unique([poolId, sourceProductId])
+  @@index([poolId])
+  @@index([sourceProductId])
+}
+
+model DosePoolSaleLink {
+  id              String   @id @default(cuid())
+  poolId          String
+  targetProductId String
+  dosesPerSale    Float
+  note            String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  pool          DosePool @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  targetProduct Product  @relation("DosePoolTargetProduct", fields: [targetProductId], references: [id], onDelete: Cascade)
+
+  @@unique([poolId, targetProductId])
+  @@index([poolId])
+  @@index([targetProductId])
+}
+
+model ExternalProductMap {
+  id          String   @id @default(cuid())
+  orgId       String
+  source      String
+  externalSku String
+  productId   String
+  createdAt   DateTime @default(now())
+
+  org     Org     @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, source, externalSku])
+  @@index([productId])
+}
+
+model Purchase {
+  id           String   @id @default(cuid())
+  orgId        String
+  fiscalYearId String
+  warehouseId  String
+  date         DateTime
+  supplier     String?
+  docNumber    String?
+  createdAt    DateTime @default(now())
+
+  org        Org        @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  fiscalYear FiscalYear @relation(fields: [fiscalYearId], references: [id], onDelete: Cascade)
+  warehouse  Warehouse  @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  lines PurchaseLine[]
+
+  @@index([orgId, date])
+  @@index([fiscalYearId])
+  @@index([warehouseId])
+}
+
+model PurchaseLine {
+  id          String @id @default(cuid())
+  purchaseId  String
+  productId   String
+  qty         Float
+  unitCostNet Float
+  vatRate     Float?
+
+  purchase Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([productId])
+}
+
+model StockMove {
+  id           String        @id @default(cuid())
+  orgId        String
+  fiscalYearId String
+  warehouseId  String
+  outletId     String?
+  type         StockMoveType
+  date         DateTime
+  note         String?
+  createdAt    DateTime      @default(now())
+
+  org        Org        @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  fiscalYear FiscalYear @relation(fields: [fiscalYearId], references: [id], onDelete: Cascade)
+  warehouse  Warehouse  @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  outlet     Outlet?    @relation(fields: [outletId], references: [id], onDelete: SetNull)
+
+  lines StockMoveLine[]
+
+  @@index([fiscalYearId])
+  @@index([warehouseId])
+  @@index([outletId])
+  @@index([date])
+}
+
+model StockMoveLine {
+  id        String @id @default(cuid())
+  moveId    String
+  productId String
+  qty       Float
+
+  move    StockMove @relation(fields: [moveId], references: [id], onDelete: Cascade)
+  product Product   @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([productId])
+}
+
+model Sale {
+  id           String   @id @default(cuid())
+  orgId        String
+  fiscalYearId String
+  outletId     String
+  date         DateTime
+  source       String   @default("MANUAL")
+  externalRef  String?
+  createdAt    DateTime @default(now())
+
+  org        Org        @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  fiscalYear FiscalYear @relation(fields: [fiscalYearId], references: [id], onDelete: Cascade)
+  outlet     Outlet     @relation(fields: [outletId], references: [id], onDelete: Cascade)
+
+  lines SaleLine[]
+
+  @@unique([orgId, source, externalRef])
+  @@index([fiscalYearId])
+  @@index([outletId, date])
+}
+
+model SaleLine {
+  id           String @id @default(cuid())
+  saleId       String
+  productId    String
+  qty          Float
+  unitPriceNet Float
+
+  sale    Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([productId])
+}
+
+model InventoryCount {
+  id           String   @id @default(cuid())
+  orgId        String
+  fiscalYearId String
+  outletId     String
+  date         DateTime
+  note         String?
+  createdAt    DateTime @default(now())
+
+  org        Org        @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  fiscalYear FiscalYear @relation(fields: [fiscalYearId], references: [id], onDelete: Cascade)
+  outlet     Outlet     @relation(fields: [outletId], references: [id], onDelete: Cascade)
+
+  lines InventoryCountLine[]
+
+  @@index([outletId, date])
+  @@index([fiscalYearId])
+}
+
+model InventoryCountLine {
+  id         String @id @default(cuid())
+  countId    String
+  productId  String
+  qtyCounted Float
+
+  count   InventoryCount @relation(fields: [countId], references: [id], onDelete: Cascade)
+  product Product        @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([productId])
+}
+
+model Expense {
+  id           String   @id @default(cuid())
+  propertyId   String
+  fiscalYearId String
+  outletId     String?
+  date         DateTime
+  amountNet    Float
+  category     String
+  note         String?
+  createdAt    DateTime @default(now())
+
+  property   Property   @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  fiscalYear FiscalYear @relation(fields: [fiscalYearId], references: [id], onDelete: Cascade)
+  outlet     Outlet?    @relation(fields: [outletId], references: [id], onDelete: SetNull)
+
+  @@index([propertyId])
+  @@index([fiscalYearId])
+  @@index([outletId])
+  @@index([date])
+}
+
+model LaborPool {
+  id           String        @id @default(cuid())
+  orgId        String
+  propertyId   String
+  fiscalYearId String
+  month        Int
+  type         LaborPoolType
+  outletId     String?
+  headcount    Int           @default(1)
+  amountNet    Float
+  note         String?
+  createdAt    DateTime      @default(now())
+
+  org        Org        @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  property   Property   @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  fiscalYear FiscalYear @relation(fields: [fiscalYearId], references: [id], onDelete: Cascade)
+
+  outlet Outlet? @relation("DirectLaborOutlet", fields: [outletId], references: [id], onDelete: SetNull)
+
+  allocations LaborAllocation[]
+
+  @@index([propertyId])
+  @@index([fiscalYearId, month])
+  @@index([outletId])
+}
+
+model LaborAllocation {
+  id          String   @id @default(cuid())
+  laborPoolId String
+  outletId    String
+  amountNet   Float
+  createdAt   DateTime @default(now())
+
+  laborPool LaborPool @relation(fields: [laborPoolId], references: [id], onDelete: Cascade)
+  outlet    Outlet    @relation(fields: [outletId], references: [id], onDelete: Cascade)
+
+  @@unique([laborPoolId, outletId])
+  @@index([outletId])
+}

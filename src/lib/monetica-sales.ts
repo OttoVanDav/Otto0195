@@ -77,7 +77,7 @@ const DEFAULT_LOOKBACK_DAYS = 2;
 const DEFAULT_HISTORY_LOOKBACK_YEARS = 10;
 const DEFAULT_SYNC_SCOPE = "default";
 const DEFAULT_BOOTSTRAP_SCOPE = "default-bootstrap";
-const DEFAULT_BOOTSTRAP_LIMIT = 20_000;
+const DEFAULT_BOOTSTRAP_LIMIT = 1_000;
 const DEFAULT_BOOTSTRAP_CHUNK_MONTHS = 1;
 const MONETICA_OUTLET_ALIAS_BY_POS_ID = new Map<string, string>([
   ["5", "bar del sole"],
@@ -490,6 +490,67 @@ async function fetchMoneticaTransactionsForRange(
   return transactions;
 }
 
+async function collectTransactionsByRange(args: {
+  endpoint: string;
+  bearerToken: string;
+  from: Date;
+  to: Date;
+  limit: number;
+  warnings: string[];
+}): Promise<{ transactions: MoneticaTransaction[]; fetchedRanges: number }> {
+  const transactions = await fetchMoneticaTransactionsForRange(
+    args.endpoint,
+    args.bearerToken,
+    args.from,
+    args.to,
+    args.limit,
+  );
+
+  if (transactions.length < args.limit || args.from.getTime() === args.to.getTime()) {
+    if (transactions.length >= args.limit) {
+      pushWarning(
+        args.warnings,
+        `Il giorno ${formatDateOnly(args.from)} ha raggiunto il limite di ${args.limit} movimenti restituiti da Monetica; il risultato potrebbe essere parziale.`,
+      );
+    }
+    return { transactions, fetchedRanges: 1 };
+  }
+
+  const mid = new Date(Math.floor((args.from.getTime() + args.to.getTime()) / 2));
+  const leftTo = startOfUtcDay(mid);
+  const rightFrom = addUtcDays(leftTo, 1);
+
+  if (rightFrom.getTime() > args.to.getTime()) {
+    pushWarning(
+      args.warnings,
+      `Il periodo ${formatDateOnly(args.from)}:${formatDateOnly(args.to)} ha raggiunto il limite di ${args.limit} movimenti restituiti da Monetica; il risultato potrebbe essere parziale.`,
+    );
+    return { transactions, fetchedRanges: 1 };
+  }
+
+  const left = await collectTransactionsByRange({
+    endpoint: args.endpoint,
+    bearerToken: args.bearerToken,
+    from: args.from,
+    to: leftTo,
+    limit: args.limit,
+    warnings: args.warnings,
+  });
+  const right = await collectTransactionsByRange({
+    endpoint: args.endpoint,
+    bearerToken: args.bearerToken,
+    from: rightFrom,
+    to: args.to,
+    limit: args.limit,
+    warnings: args.warnings,
+  });
+
+  return {
+    transactions: [...left.transactions, ...right.transactions],
+    fetchedRanges: left.fetchedRanges + right.fetchedRanges,
+  };
+}
+
 async function collectTransactionsByDay(args: {
   endpoint: string;
   bearerToken: string;
@@ -875,20 +936,16 @@ export async function syncOfficialMoneticaSales(
     }
 
     const warnings: string[] = [];
-    const bootstrapLimit = Math.max(limitPerDay, DEFAULT_BOOTSTRAP_LIMIT);
-    const bootstrapTransactions = await fetchMoneticaTransactionsForRange(
+    const bootstrapLimit = Math.min(Math.max(limitPerDay, DEFAULT_LIMIT_PER_DAY), DEFAULT_BOOTSTRAP_LIMIT);
+    const bootstrapFetched = await collectTransactionsByRange({
       endpoint,
       bearerToken,
-      bootstrapChunk.from,
-      bootstrapChunk.to,
-      bootstrapLimit,
-    );
-    if (bootstrapTransactions.length >= bootstrapLimit) {
-      pushWarning(
-        warnings,
-        `Il periodo ${formatDateOnly(bootstrapChunk.from)}:${formatDateOnly(bootstrapChunk.to)} ha raggiunto il limite di ${bootstrapLimit} movimenti restituiti da Monetica; il risultato potrebbe essere parziale.`,
-      );
-    }
+      from: bootstrapChunk.from,
+      to: bootstrapChunk.to,
+      limit: bootstrapLimit,
+      warnings,
+    });
+    const bootstrapTransactions = bootstrapFetched.transactions;
 
     const importResult = await importMoneticaTransactionsIntoProperty(propertyId, bootstrapTransactions);
     const mergedWarnings = [...importResult.warnings];
@@ -923,7 +980,7 @@ export async function syncOfficialMoneticaSales(
       syncedFrom: formatDateOnly(bootstrapChunk.from),
       syncedTo: formatDateOnly(bootstrapChunk.to),
       fetchedTransactions: bootstrapTransactions.length,
-      fetchedDays: 1,
+      fetchedDays: bootstrapFetched.fetchedRanges,
       limitPerDay: bootstrapLimit,
       performedSync: true,
       lastSyncedAt: updatedState?.lastSyncedAt ?? new Date(),

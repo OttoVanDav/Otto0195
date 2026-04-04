@@ -5,7 +5,7 @@ import { averageOutletCostRows, listOutletCostsForOutlets } from "@/lib/outlet-p
 import { getOutletConfiguredPrice } from "@/lib/outlet-product-prices";
 import { buildDoseDerivedCostMaps } from "@/lib/product-doses";
 import { grossToNetSaleUnitPrice } from "@/lib/sales-vat";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import AutoRefresh from "./auto-refresh";
 
@@ -17,6 +17,13 @@ type Props = {
     fromOutletId?: string;
     from?: string;
     to?: string;
+    sync?: string;
+    syncMessage?: string;
+    syncImported?: string;
+    syncSkipped?: string;
+    syncFetched?: string;
+    syncFrom?: string;
+    syncTo?: string;
   }>;
 };
 
@@ -39,6 +46,13 @@ export default async function SalesPage({ params, searchParams }: Props) {
   const filterFrom = rawFrom ?? rawTo;
   const filterTo = rawTo ?? rawFrom;
   const hasDateFilter = Boolean(filterFrom || filterTo);
+  const syncStatus = (sp.sync ?? "").trim();
+  const syncMessage = (sp.syncMessage ?? "").trim();
+  const syncImported = Number(sp.syncImported ?? 0);
+  const syncSkipped = Number(sp.syncSkipped ?? 0);
+  const syncFetched = Number(sp.syncFetched ?? 0);
+  const syncRangeFrom = normalizeDateInput(sp.syncFrom);
+  const syncRangeTo = normalizeDateInput(sp.syncTo);
 
   const property = await prisma.property.findUnique({
     where: { id: propertyId },
@@ -293,19 +307,70 @@ export default async function SalesPage({ params, searchParams }: Props) {
 
   async function syncMoneticaSalesAction() {
     "use server";
-    if (!process.env.MONETICA_TRANSACTIONS_URL || !process.env.MONETICA_API_BEARER_TOKEN) return;
+    if (!process.env.MONETICA_TRANSACTIONS_URL || !process.env.MONETICA_API_BEARER_TOKEN) {
+      redirect(
+        buildSalesPageHref({
+          propertyId,
+          year,
+          outletId: outletFilter,
+          fromOutletId,
+          from: rawFrom,
+          to: rawTo,
+          sync: "error",
+          syncMessage: "Configura MONETICA_TRANSACTIONS_URL e MONETICA_API_BEARER_TOKEN.",
+        }),
+      );
+    }
 
-    await syncOfficialMoneticaSales(propertyId, {
-      from: filterFrom ?? undefined,
-      to: filterTo ?? undefined,
-      force: true,
-      allowHistoricalBootstrap: true,
-    }).catch(() => null);
+    try {
+      const result = await syncOfficialMoneticaSales(propertyId, {
+        from: filterFrom ?? undefined,
+        to: filterTo ?? undefined,
+        force: true,
+        allowHistoricalBootstrap: true,
+      });
 
-    revalidatePath(`/properties/${propertyId}/sales`);
-    revalidatePath(`/properties/${propertyId}/outlets`);
-    revalidatePath(`/properties/${propertyId}?year=${year}`);
-    revalidatePath(`/properties/${propertyId}/analytics?year=${year}`);
+      revalidatePath(`/properties/${propertyId}/sales`);
+      revalidatePath(`/properties/${propertyId}/outlets`);
+      revalidatePath(`/properties/${propertyId}?year=${year}`);
+      revalidatePath(`/properties/${propertyId}/analytics?year=${year}`);
+
+      const successMessage = result.performedSync
+        ? `Sync completata: ${result.importedSales} scontrini importati, ${result.skippedSales} scartati.`
+        : "Nessuna nuova transazione da sincronizzare in questo momento.";
+
+      redirect(
+        buildSalesPageHref({
+          propertyId,
+          year,
+          outletId: outletFilter,
+          fromOutletId,
+          from: rawFrom,
+          to: rawTo,
+          sync: result.performedSync ? "ok" : "idle",
+          syncMessage: successMessage,
+          syncImported: String(result.importedSales),
+          syncSkipped: String(result.skippedSales),
+          syncFetched: String(result.fetchedTransactions),
+          syncFrom: result.syncedFrom,
+          syncTo: result.syncedTo,
+        }),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Sync Monetica fallita.";
+      redirect(
+        buildSalesPageHref({
+          propertyId,
+          year,
+          outletId: outletFilter,
+          fromOutletId,
+          from: rawFrom,
+          to: rawTo,
+          sync: "error",
+          syncMessage: message,
+        }),
+      );
+    }
   }
 
   return (
@@ -411,6 +476,28 @@ export default async function SalesPage({ params, searchParams }: Props) {
                   </div>
                 </div>
               </div>
+
+              {syncStatus ? (
+                <div
+                  className={`mt-4 rounded-2xl border p-4 text-sm ${
+                    syncStatus === "error"
+                      ? "border-red-200 bg-red-50 text-red-950"
+                      : syncStatus === "ok"
+                        ? "border-emerald-200 bg-emerald-50 text-emerald-950"
+                        : "border-zinc-200 bg-zinc-50 text-zinc-900"
+                  }`}
+                >
+                  <div className="font-semibold">
+                    {syncStatus === "error" ? "Errore sincronizzazione" : "Esito sincronizzazione"}
+                  </div>
+                  {syncMessage ? <div className="mt-1">{syncMessage}</div> : null}
+                  {syncStatus !== "error" ? (
+                    <div className="mt-2 text-xs">
+                      Finestra processata: {syncRangeFrom && syncRangeTo ? `${formatDateLabel(syncRangeFrom)} - ${formatDateLabel(syncRangeTo)}` : "n/d"} · movimenti letti: {Number.isFinite(syncFetched) ? syncFetched : 0} · scontrini importati: {Number.isFinite(syncImported) ? syncImported : 0} · scontrini scartati: {Number.isFinite(syncSkipped) ? syncSkipped : 0}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
 
               <div className="mt-4 space-y-2 text-sm text-zinc-700">
                 <div>
@@ -744,6 +831,13 @@ function buildSalesPageHref({
   fromOutletId,
   from,
   to,
+  sync,
+  syncMessage,
+  syncImported,
+  syncSkipped,
+  syncFetched,
+  syncFrom,
+  syncTo,
 }: {
   propertyId: string;
   year: number;
@@ -751,6 +845,13 @@ function buildSalesPageHref({
   fromOutletId?: string;
   from?: string | null;
   to?: string | null;
+  sync?: string;
+  syncMessage?: string;
+  syncImported?: string;
+  syncSkipped?: string;
+  syncFetched?: string;
+  syncFrom?: string;
+  syncTo?: string;
 }) {
   const params = new URLSearchParams();
   params.set("year", String(year));
@@ -758,6 +859,13 @@ function buildSalesPageHref({
   if (fromOutletId) params.set("fromOutletId", fromOutletId);
   if (from) params.set("from", from);
   if (to) params.set("to", to);
+  if (sync) params.set("sync", sync);
+  if (syncMessage) params.set("syncMessage", syncMessage);
+  if (syncImported) params.set("syncImported", syncImported);
+  if (syncSkipped) params.set("syncSkipped", syncSkipped);
+  if (syncFetched) params.set("syncFetched", syncFetched);
+  if (syncFrom) params.set("syncFrom", syncFrom);
+  if (syncTo) params.set("syncTo", syncTo);
   const query = params.toString();
   return `/properties/${propertyId}/sales${query ? `?${query}` : ""}`;
 }

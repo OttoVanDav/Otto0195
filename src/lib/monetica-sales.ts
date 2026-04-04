@@ -76,6 +76,9 @@ const DEFAULT_SYNC_THROTTLE_MS = 10 * 60 * 1000;
 const DEFAULT_LOOKBACK_DAYS = 2;
 const DEFAULT_HISTORY_LOOKBACK_YEARS = 10;
 const DEFAULT_SYNC_SCOPE = "default";
+const DEFAULT_BOOTSTRAP_SCOPE = "default-bootstrap";
+const DEFAULT_BOOTSTRAP_LIMIT = 20_000;
+const DEFAULT_BOOTSTRAP_CHUNK_MONTHS = 1;
 const MONETICA_OUTLET_ALIAS_BY_POS_ID = new Map<string, string>([
   ["5", "bar del sole"],
   ["20", "bar dello sport"],
@@ -155,8 +158,20 @@ function addUtcDays(date: Date, days: number) {
   return copy;
 }
 
+function addUtcMonths(date: Date, months: number) {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + months, 1));
+}
+
 function startOfUtcYear(year: number) {
   return new Date(Date.UTC(year, 0, 1));
+}
+
+function startOfUtcMonth(date: Date) {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
+}
+
+function endOfUtcMonth(date: Date) {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0));
 }
 
 function startOfUtcDay(date: Date) {
@@ -424,6 +439,26 @@ async function getBootstrapStartYear(propertyId: string, today: Date) {
   return today.getUTCFullYear() - DEFAULT_HISTORY_LOOKBACK_YEARS;
 }
 
+async function resolveBootstrapChunk(args: {
+  propertyId: string;
+  today: Date;
+  bootstrapState: SyncStateRow | null;
+  restart: boolean;
+}) {
+  const bootstrapStartYear = await getBootstrapStartYear(args.propertyId, args.today);
+  const overallFrom = startOfUtcYear(bootstrapStartYear);
+  const processedTo = !args.restart ? parseDateOnly(args.bootstrapState?.syncedTo) : null;
+  const from = processedTo ? addUtcDays(processedTo, 1) : overallFrom;
+  if (from.getTime() > args.today.getTime()) return null;
+
+  const startMonth = startOfUtcMonth(from);
+  const endMonth = addUtcMonths(startMonth, DEFAULT_BOOTSTRAP_CHUNK_MONTHS - 1);
+  const toCandidate = endOfUtcMonth(endMonth);
+  const to = toCandidate.getTime() > args.today.getTime() ? args.today : toCandidate;
+
+  return { overallFrom, from, to };
+}
+
 async function fetchMoneticaTransactionsForRange(
   endpoint: string,
   bearerToken: string,
@@ -686,56 +721,19 @@ export async function syncOfficialMoneticaSales(
 
   const hasExplicitRange = Boolean(options?.from || options?.to);
   const today = startOfUtcDay(new Date());
-  const range = hasExplicitRange
-    ? resolveSyncRange(options?.from, options?.to)
-    : { from: today, to: today, scope: DEFAULT_SYNC_SCOPE };
-  const existingState = await getSyncState(propertyId, range.scope);
   const throttleMs = options?.throttleMs ?? DEFAULT_SYNC_THROTTLE_MS;
-  const lastSyncedAt = existingState?.lastSyncedAt ?? null;
   const limitPerDay = options?.limitPerDay ?? DEFAULT_LIMIT_PER_DAY;
 
-  if (
-    !options?.force &&
-    hasExplicitRange &&
-    lastSyncedAt &&
-    Date.now() - new Date(lastSyncedAt).getTime() < throttleMs
-  ) {
-    return {
-      mode: "official",
-      propertyId,
-      importedSales: 0,
-      importedLines: 0,
-      skippedSales: 0,
-      skippedLines: 0,
-      warnings: [],
-      syncedFrom: formatDateOnly(range.from),
-      syncedTo: formatDateOnly(range.to),
-      fetchedTransactions: 0,
-      fetchedDays: 0,
-      limitPerDay,
-      performedSync: false,
-      lastSyncedAt,
-    };
-  }
-
-  const warnings: string[] = [];
-  let fetchedTransactions: MoneticaTransaction[] = [];
-  let fetchedDays = 0;
-  let syncedFrom = range.from;
-  let syncedTo = range.to;
-
-  if (!hasExplicitRange) {
-    const latestImportedSaleDate = await getLatestImportedMoneticaSaleDate(propertyId);
-    const defaultState = existingState;
-    const hasImportedSales = Boolean(latestImportedSaleDate);
+  if (hasExplicitRange) {
+    const range = resolveSyncRange(options?.from, options?.to);
+    const existingState = await getSyncState(propertyId, range.scope);
+    const lastSyncedAt = existingState?.lastSyncedAt ?? null;
 
     if (
       !options?.force &&
-      hasImportedSales &&
       lastSyncedAt &&
       Date.now() - new Date(lastSyncedAt).getTime() < throttleMs
     ) {
-      const throttledFrom = parseDateOnly(defaultState?.syncedTo) ?? startOfUtcDay(latestImportedSaleDate ?? today);
       return {
         mode: "official",
         propertyId,
@@ -744,7 +742,129 @@ export async function syncOfficialMoneticaSales(
         skippedSales: 0,
         skippedLines: 0,
         warnings: [],
-        syncedFrom: formatDateOnly(throttledFrom),
+        syncedFrom: formatDateOnly(range.from),
+        syncedTo: formatDateOnly(range.to),
+        fetchedTransactions: 0,
+        fetchedDays: 0,
+        limitPerDay,
+        performedSync: false,
+        lastSyncedAt,
+      };
+    }
+
+    const warnings: string[] = [];
+    const fetched = await collectTransactionsByDay({
+      endpoint,
+      bearerToken,
+      from: range.from,
+      to: range.to,
+      limitPerDay,
+      warnings,
+    });
+    const importResult = await importMoneticaTransactionsIntoProperty(propertyId, fetched.transactions);
+    const mergedWarnings = [...importResult.warnings];
+    for (const warning of warnings) {
+      pushWarning(mergedWarnings, warning);
+    }
+
+    await upsertSyncState(propertyId, range.scope, formatDateOnly(range.from), formatDateOnly(range.to));
+    const updatedState = await getSyncState(propertyId, range.scope);
+
+    return {
+      mode: "official",
+      propertyId,
+      importedSales: importResult.importedSales,
+      importedLines: importResult.importedLines,
+      skippedSales: importResult.skippedSales,
+      skippedLines: importResult.skippedLines,
+      warnings: mergedWarnings,
+      syncedFrom: formatDateOnly(range.from),
+      syncedTo: formatDateOnly(range.to),
+      fetchedTransactions: fetched.transactions.length,
+      fetchedDays: fetched.fetchedDays,
+      limitPerDay,
+      performedSync: true,
+      lastSyncedAt: updatedState?.lastSyncedAt ?? new Date(),
+    };
+  }
+
+  const latestImportedSaleDate = await getLatestImportedMoneticaSaleDate(propertyId);
+  const hasImportedSales = Boolean(latestImportedSaleDate);
+  const incrementalState = await getSyncState(propertyId, DEFAULT_SYNC_SCOPE);
+  const bootstrapState = await getSyncState(propertyId, DEFAULT_BOOTSTRAP_SCOPE);
+  const bootstrapSyncedTo = parseDateOnly(bootstrapState?.syncedTo);
+  const bootstrapInProgress = Boolean(
+    bootstrapSyncedTo && bootstrapSyncedTo.getTime() < today.getTime(),
+  );
+  const shouldRunBootstrap =
+    !hasImportedSales &&
+    (Boolean(options?.allowHistoricalBootstrap) || bootstrapInProgress);
+  const activeState = shouldRunBootstrap ? bootstrapState : incrementalState;
+  const lastSyncedAt = activeState?.lastSyncedAt ?? null;
+
+  if (
+    !options?.force &&
+    lastSyncedAt &&
+    Date.now() - new Date(lastSyncedAt).getTime() < throttleMs
+  ) {
+    const throttledFrom = shouldRunBootstrap
+      ? parseDateOnly(bootstrapState?.syncedTo) ?? today
+      : parseDateOnly(incrementalState?.syncedTo) ?? startOfUtcDay(latestImportedSaleDate ?? today);
+    return {
+      mode: "official",
+      propertyId,
+      importedSales: 0,
+      importedLines: 0,
+      skippedSales: 0,
+      skippedLines: 0,
+      warnings: [],
+      syncedFrom: formatDateOnly(throttledFrom),
+      syncedTo: formatDateOnly(today),
+      fetchedTransactions: 0,
+      fetchedDays: 0,
+      limitPerDay,
+      performedSync: false,
+      lastSyncedAt,
+    };
+  }
+
+  if (!hasImportedSales && !shouldRunBootstrap) {
+    return {
+      mode: "official",
+      propertyId,
+      importedSales: 0,
+      importedLines: 0,
+      skippedSales: 0,
+      skippedLines: 0,
+      warnings: [],
+      syncedFrom: formatDateOnly(today),
+      syncedTo: formatDateOnly(today),
+      fetchedTransactions: 0,
+      fetchedDays: 0,
+      limitPerDay,
+      performedSync: false,
+      lastSyncedAt: null,
+    };
+  }
+
+  if (shouldRunBootstrap) {
+    const bootstrapChunk = await resolveBootstrapChunk({
+      propertyId,
+      today,
+      bootstrapState,
+      restart: Boolean(options?.force && !hasImportedSales && options?.allowHistoricalBootstrap),
+    });
+
+    if (!bootstrapChunk) {
+      return {
+        mode: "official",
+        propertyId,
+        importedSales: 0,
+        importedLines: 0,
+        skippedSales: 0,
+        skippedLines: 0,
+        warnings: [],
+        syncedFrom: formatDateOnly(today),
         syncedTo: formatDateOnly(today),
         fetchedTransactions: 0,
         fetchedDays: 0,
@@ -754,96 +874,81 @@ export async function syncOfficialMoneticaSales(
       };
     }
 
-    if (!hasImportedSales) {
-      if (!options?.allowHistoricalBootstrap) {
-        return {
-          mode: "official",
-          propertyId,
-          importedSales: 0,
-          importedLines: 0,
-          skippedSales: 0,
-          skippedLines: 0,
-          warnings: [],
-          syncedFrom: formatDateOnly(today),
-          syncedTo: formatDateOnly(today),
-          fetchedTransactions: 0,
-          fetchedDays: 0,
-          limitPerDay,
-          performedSync: false,
-          lastSyncedAt: null,
-        };
-      }
-
-      const bootstrapStartYear = await getBootstrapStartYear(propertyId, today);
-      syncedFrom = startOfUtcYear(bootstrapStartYear);
-      syncedTo = today;
-
-      for (
-        let year = bootstrapStartYear;
-        year <= today.getUTCFullYear();
-        year += 1
-      ) {
-        for (let month = 0; month < 12; month += 1) {
-          const monthFrom = new Date(Date.UTC(year, month, 1));
-          if (monthFrom.getTime() > today.getTime()) break;
-
-          const monthTo = new Date(Date.UTC(year, month + 1, 0));
-          const boundedMonthTo = monthTo.getTime() > today.getTime() ? today : monthTo;
-          const monthTransactions = await fetchMoneticaTransactionsForRange(
-            endpoint,
-            bearerToken,
-            monthFrom,
-            boundedMonthTo,
-            Math.max(limitPerDay, 20000),
-          );
-
-          fetchedDays += 1;
-          fetchedTransactions.push(...monthTransactions);
-
-          if (monthTransactions.length >= Math.max(limitPerDay, 20000)) {
-            pushWarning(
-              warnings,
-              `Il periodo ${formatDateOnly(monthFrom)}:${formatDateOnly(boundedMonthTo)} ha raggiunto il limite di ${Math.max(limitPerDay, 20000)} movimenti restituiti da Monetica; il risultato potrebbe essere parziale.`,
-            );
-          }
-        }
-      }
-    } else {
-      syncedFrom = parseDateOnly(defaultState?.syncedTo) ?? startOfUtcDay(latestImportedSaleDate ?? today);
-      syncedTo = today;
-
-      const incrementalResult = await collectTransactionsByDay({
-        endpoint,
-        bearerToken,
-        from: syncedFrom,
-        to: syncedTo,
-        limitPerDay,
-        warnings,
-      });
-      fetchedTransactions = incrementalResult.transactions;
-      fetchedDays = incrementalResult.fetchedDays;
-    }
-  } else {
-    const explicitResult = await collectTransactionsByDay({
+    const warnings: string[] = [];
+    const bootstrapLimit = Math.max(limitPerDay, DEFAULT_BOOTSTRAP_LIMIT);
+    const bootstrapTransactions = await fetchMoneticaTransactionsForRange(
       endpoint,
       bearerToken,
-      from: range.from,
-      to: range.to,
-      limitPerDay,
-      warnings,
-    });
-    fetchedTransactions = explicitResult.transactions;
-    fetchedDays = explicitResult.fetchedDays;
+      bootstrapChunk.from,
+      bootstrapChunk.to,
+      bootstrapLimit,
+    );
+    if (bootstrapTransactions.length >= bootstrapLimit) {
+      pushWarning(
+        warnings,
+        `Il periodo ${formatDateOnly(bootstrapChunk.from)}:${formatDateOnly(bootstrapChunk.to)} ha raggiunto il limite di ${bootstrapLimit} movimenti restituiti da Monetica; il risultato potrebbe essere parziale.`,
+      );
+    }
+
+    const importResult = await importMoneticaTransactionsIntoProperty(propertyId, bootstrapTransactions);
+    const mergedWarnings = [...importResult.warnings];
+    for (const warning of warnings) {
+      pushWarning(mergedWarnings, warning);
+    }
+
+    await upsertSyncState(
+      propertyId,
+      DEFAULT_BOOTSTRAP_SCOPE,
+      formatDateOnly(bootstrapChunk.overallFrom),
+      formatDateOnly(bootstrapChunk.to),
+    );
+    if (bootstrapChunk.to.getTime() >= today.getTime()) {
+      await upsertSyncState(
+        propertyId,
+        DEFAULT_SYNC_SCOPE,
+        formatDateOnly(bootstrapChunk.overallFrom),
+        formatDateOnly(bootstrapChunk.to),
+      );
+    }
+    const updatedState = await getSyncState(propertyId, DEFAULT_BOOTSTRAP_SCOPE);
+
+    return {
+      mode: "official",
+      propertyId,
+      importedSales: importResult.importedSales,
+      importedLines: importResult.importedLines,
+      skippedSales: importResult.skippedSales,
+      skippedLines: importResult.skippedLines,
+      warnings: mergedWarnings,
+      syncedFrom: formatDateOnly(bootstrapChunk.from),
+      syncedTo: formatDateOnly(bootstrapChunk.to),
+      fetchedTransactions: bootstrapTransactions.length,
+      fetchedDays: 1,
+      limitPerDay: bootstrapLimit,
+      performedSync: true,
+      lastSyncedAt: updatedState?.lastSyncedAt ?? new Date(),
+    };
   }
 
-  const importResult = await importMoneticaTransactionsIntoProperty(propertyId, fetchedTransactions);
+  const warnings: string[] = [];
+  const syncedFrom = parseDateOnly(incrementalState?.syncedTo) ?? startOfUtcDay(latestImportedSaleDate ?? today);
+  const syncedTo = today;
+  const fetched = await collectTransactionsByDay({
+    endpoint,
+    bearerToken,
+    from: syncedFrom,
+    to: syncedTo,
+    limitPerDay,
+    warnings,
+  });
+  const importResult = await importMoneticaTransactionsIntoProperty(propertyId, fetched.transactions);
   const mergedWarnings = [...importResult.warnings];
   for (const warning of warnings) {
     pushWarning(mergedWarnings, warning);
   }
 
-  await upsertSyncState(propertyId, range.scope, formatDateOnly(syncedFrom), formatDateOnly(syncedTo));
-  const updatedState = await getSyncState(propertyId, range.scope);
+  await upsertSyncState(propertyId, DEFAULT_SYNC_SCOPE, formatDateOnly(syncedFrom), formatDateOnly(syncedTo));
+  const updatedState = await getSyncState(propertyId, DEFAULT_SYNC_SCOPE);
 
   return {
     mode: "official",
@@ -855,8 +960,8 @@ export async function syncOfficialMoneticaSales(
     warnings: mergedWarnings,
     syncedFrom: formatDateOnly(syncedFrom),
     syncedTo: formatDateOnly(syncedTo),
-    fetchedTransactions: fetchedTransactions.length,
-    fetchedDays,
+    fetchedTransactions: fetched.transactions.length,
+    fetchedDays: fetched.fetchedDays,
     limitPerDay,
     performedSync: true,
     lastSyncedAt: updatedState?.lastSyncedAt ?? new Date(),

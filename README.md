@@ -42,6 +42,7 @@ Imposta su Railway almeno queste variabili:
 - `MONETICA_API_BEARER_TOKEN`
 - `MONETICA_ARTICLES_URL`
 - `MONETICA_TRANSACTIONS_URL`
+- `MONETICA_BOOTSTRAP_START_YEAR` opzionale, per limitare l'anno iniziale del primo import storico vendite
 - `MONETICA_WEBHOOK_SECRET`
 
 Puoi usare `.env.example` come base.

@@ -237,7 +237,7 @@ export default async function SalesPage({ params, searchParams }: Props) {
   const periodLabel = hasDateFilter ? formatPeriodLabel(filterFrom, filterTo) : `Intero anno ${year}`;
   const autoSyncLabel = hasDateFilter
     ? `il periodo filtrato viene letto subito dal database; se vuoi riallinearlo con Monetica usa "Sincronizza vendite"`
-    : "ultimi 3 giorni";
+    : "al primo import viene acquisito tutto lo storico disponibile; poi vengono riallineate solo le nuove transazioni";
 
   async function createManualSale(formData: FormData) {
     "use server";
@@ -424,7 +424,7 @@ export default async function SalesPage({ params, searchParams }: Props) {
                   Fonte registrata automaticamente: <code className="rounded bg-zinc-100 px-1.5 py-0.5 text-xs">MONETICA</code>
                 </div>
                 <div>
-                  Aggiornamento automatico pagina: ogni <code className="rounded bg-zinc-100 px-1.5 py-0.5 text-xs">10 minuti</code> sullo stesso periodo visualizzato; senza filtro data viene riallineato l&apos;ultimo blocco di vendite ({autoSyncLabel}).
+                  Aggiornamento automatico pagina: ogni <code className="rounded bg-zinc-100 px-1.5 py-0.5 text-xs">10 minuti</code> sullo stesso periodo visualizzato; senza filtro data la sync segue questa logica: {autoSyncLabel}.
                 </div>
                 <div>
                   Alias outlet Monetica gestiti: <code className="rounded bg-zinc-100 px-1.5 py-0.5 text-xs">Chalet mare</code> viene importato su <code className="rounded bg-zinc-100 px-1.5 py-0.5 text-xs">Bar Del Mare</code>.
@@ -442,7 +442,8 @@ export default async function SalesPage({ params, searchParams }: Props) {
                 <ul className="mt-2 list-disc space-y-1 pl-5">
                   <li><code>pos_name</code> viene allineato ai nomi interni anche quando Monetica usa alias come <code>Chalet mare</code> per <code>Bar Del Mare</code>.</li>
                   <li><code>transaction_items[].sku</code> deve essere mappato nella pagina prodotti come Mapping Monetica.</li>
-                  <li>La sync ufficiale usa l&apos;endpoint Monetica con filtro <code>from</code>/<code>to</code> e salva gli scontrini raggruppati per <code>transaction_id</code>.</li>
+                  <li>La sync ufficiale salva gli scontrini raggruppati per <code>transaction_id</code> e non duplica le vendite gia registrate.</li>
+                  <li>Senza filtro data, se il database vendite Monetica e vuoto viene importato tutto lo storico disponibile; dalle sync successive vengono richieste solo le transazioni nuove.</li>
                   <li>Con un filtro data esteso la pagina mostra subito lo storico gia importato nel DB; il bottone <code>Sincronizza vendite</code> aggiorna esplicitamente quel periodo.</li>
                 </ul>
               </div>

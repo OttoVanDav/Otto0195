@@ -58,11 +58,19 @@ type SyncRange = {
   scope: string;
 };
 
+type SyncStateRow = {
+  syncedFrom: string | null;
+  syncedTo: string | null;
+  lastSyncedAt: Date | null;
+};
+
 const MONETICA_SALES_SOURCE = "MONETICA";
 const MONETICA_SYNC_STATE_SOURCE = "MONETICA_OFFICIAL_SALES";
 const DEFAULT_LIMIT_PER_DAY = 1000;
 const DEFAULT_SYNC_THROTTLE_MS = 10 * 60 * 1000;
 const DEFAULT_LOOKBACK_DAYS = 2;
+const DEFAULT_HISTORY_LOOKBACK_YEARS = 10;
+const DEFAULT_SYNC_SCOPE = "default";
 const MONETICA_OUTLET_ALIAS_BY_POS_ID = new Map<string, string>([
   ["5", "bar del sole"],
   ["20", "bar dello sport"],
@@ -140,6 +148,14 @@ function addUtcDays(date: Date, days: number) {
   const copy = new Date(date);
   copy.setUTCDate(copy.getUTCDate() + days);
   return copy;
+}
+
+function startOfUtcYear(year: number) {
+  return new Date(Date.UTC(year, 0, 1));
+}
+
+function endOfUtcYear(year: number) {
+  return new Date(Date.UTC(year, 11, 31));
 }
 
 function startOfUtcDay(date: Date) {
@@ -295,10 +311,10 @@ async function ensureMoneticaSyncStateTable() {
   `);
 }
 
-async function getSyncState(propertyId: string, scope: string) {
+async function getSyncState(propertyId: string, scope: string): Promise<SyncStateRow | null> {
   await ensureMoneticaSyncStateTable();
-  const rows = await prisma.$queryRaw<Array<{ lastSyncedAt: Date | null }>>`
-    SELECT "lastSyncedAt"
+  const rows = await prisma.$queryRaw<SyncStateRow[]>`
+    SELECT "syncedFrom", "syncedTo", "lastSyncedAt"
     FROM "IntegrationSyncState"
     WHERE "propertyId" = ${propertyId}
       AND "source" = ${MONETICA_SYNC_STATE_SOURCE}
@@ -353,6 +369,134 @@ function resolveSyncRange(from?: string | null, to?: string | null): SyncRange {
     to: rangeTo,
     scope: fromLabel === toLabel ? `range:${fromLabel}` : `range:${fromLabel}:${toLabel}`,
   };
+}
+
+async function getLatestImportedMoneticaSaleDate(propertyId: string) {
+  const latestSale = await prisma.sale.findFirst({
+    where: {
+      source: MONETICA_SALES_SOURCE,
+      outlet: { propertyId },
+    },
+    orderBy: { date: "desc" },
+    select: { date: true },
+  });
+  return latestSale?.date ?? null;
+}
+
+async function getBootstrapStartYear(propertyId: string, today: Date) {
+  const configuredYear = Number(process.env.MONETICA_BOOTSTRAP_START_YEAR?.trim() ?? "");
+  if (Number.isFinite(configuredYear) && configuredYear > 2000 && configuredYear <= today.getUTCFullYear()) {
+    return Math.trunc(configuredYear);
+  }
+
+  const property = await prisma.property.findUnique({
+    where: { id: propertyId },
+    select: {
+      org: {
+        select: {
+          fiscalYears: {
+            select: { year: true },
+            orderBy: { year: "asc" },
+            take: 1,
+          },
+        },
+      },
+    },
+  });
+
+  const earliestFiscalYear = property?.org.fiscalYears[0]?.year ?? null;
+  if (typeof earliestFiscalYear === "number" && earliestFiscalYear <= today.getUTCFullYear()) {
+    return earliestFiscalYear;
+  }
+
+  return today.getUTCFullYear() - DEFAULT_HISTORY_LOOKBACK_YEARS;
+}
+
+async function fetchMoneticaTransactionsForRange(
+  endpoint: string,
+  bearerToken: string,
+  from: Date,
+  to: Date,
+  limit: number,
+) {
+  const url = new URL(endpoint);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("from", formatDateOnly(from));
+  url.searchParams.set("to", formatDateOnly(to));
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: { authorization: `Bearer ${bearerToken}` },
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error(`Monetica sales request failed with status ${response.status} for ${formatDateOnly(from)}:${formatDateOnly(to)}`);
+  }
+
+  const body: unknown = await response.json().catch(() => null);
+  const transactions = extractMoneticaTransactions(body);
+  if (!transactions) {
+    throw new Error(`Monetica sales response is not a valid transactions array for ${formatDateOnly(from)}:${formatDateOnly(to)}`);
+  }
+
+  return transactions;
+}
+
+async function collectTransactionsByDay(args: {
+  endpoint: string;
+  bearerToken: string;
+  from: Date;
+  to: Date;
+  limitPerDay: number;
+  warnings: string[];
+}) {
+  const transactions: MoneticaTransaction[] = [];
+  let fetchedDays = 0;
+
+  for (let cursor = args.from; cursor.getTime() <= args.to.getTime(); cursor = addUtcDays(cursor, 1)) {
+    const day = formatDateOnly(cursor);
+    const dayTransactions = await fetchMoneticaTransactionsForRange(
+      args.endpoint,
+      args.bearerToken,
+      cursor,
+      cursor,
+      args.limitPerDay,
+    );
+
+    fetchedDays += 1;
+    transactions.push(...dayTransactions);
+
+    if (dayTransactions.length >= args.limitPerDay) {
+      pushWarning(
+        args.warnings,
+        `Il giorno ${day} ha raggiunto il limite di ${args.limitPerDay} movimenti restituiti da Monetica; il risultato potrebbe essere parziale.`,
+      );
+    }
+  }
+
+  return { transactions, fetchedDays };
+}
+
+async function discoverBootstrapYears(
+  propertyId: string,
+  endpoint: string,
+  bearerToken: string,
+  today: Date,
+) {
+  const bootstrapStartYear = await getBootstrapStartYear(propertyId, today);
+  const years: number[] = [];
+
+  for (let year = today.getUTCFullYear(); year >= bootstrapStartYear; year -= 1) {
+    const from = startOfUtcYear(year);
+    const to = year === today.getUTCFullYear() ? today : endOfUtcYear(year);
+    const probeTransactions = await fetchMoneticaTransactionsForRange(endpoint, bearerToken, from, to, 1);
+    if (probeTransactions.length > 0) {
+      years.push(year);
+    }
+  }
+
+  return years.sort((a, b) => a - b);
 }
 
 export async function importMoneticaTransactionsIntoProperty(
@@ -502,13 +646,19 @@ export async function syncOfficialMoneticaSales(
     throw new Error("MONETICA_TRANSACTIONS_URL or MONETICA_API_BEARER_TOKEN missing");
   }
 
-  const range = resolveSyncRange(options?.from, options?.to);
+  const hasExplicitRange = Boolean(options?.from || options?.to);
+  const today = startOfUtcDay(new Date());
+  const range = hasExplicitRange
+    ? resolveSyncRange(options?.from, options?.to)
+    : { from: today, to: today, scope: DEFAULT_SYNC_SCOPE };
   const existingState = await getSyncState(propertyId, range.scope);
   const throttleMs = options?.throttleMs ?? DEFAULT_SYNC_THROTTLE_MS;
   const lastSyncedAt = existingState?.lastSyncedAt ?? null;
+  const limitPerDay = options?.limitPerDay ?? DEFAULT_LIMIT_PER_DAY;
 
   if (
     !options?.force &&
+    hasExplicitRange &&
     lastSyncedAt &&
     Date.now() - new Date(lastSyncedAt).getTime() < throttleMs
   ) {
@@ -524,49 +674,117 @@ export async function syncOfficialMoneticaSales(
       syncedTo: formatDateOnly(range.to),
       fetchedTransactions: 0,
       fetchedDays: 0,
-      limitPerDay: options?.limitPerDay ?? DEFAULT_LIMIT_PER_DAY,
+      limitPerDay,
       performedSync: false,
       lastSyncedAt,
     };
   }
 
-  const limitPerDay = options?.limitPerDay ?? DEFAULT_LIMIT_PER_DAY;
   const warnings: string[] = [];
-  const fetchedTransactions: MoneticaTransaction[] = [];
+  let fetchedTransactions: MoneticaTransaction[] = [];
   let fetchedDays = 0;
+  let syncedFrom = range.from;
+  let syncedTo = range.to;
 
-  for (let cursor = range.from; cursor.getTime() <= range.to.getTime(); cursor = addUtcDays(cursor, 1)) {
-    const day = formatDateOnly(cursor);
-    const url = new URL(endpoint);
-    url.searchParams.set("limit", String(limitPerDay));
-    url.searchParams.set("from", day);
-    url.searchParams.set("to", day);
+  if (!hasExplicitRange) {
+    const latestImportedSaleDate = await getLatestImportedMoneticaSaleDate(propertyId);
+    const defaultState = existingState;
+    const hasBootstrapedData = Boolean(defaultState || latestImportedSaleDate);
 
-    const response = await fetch(url, {
-      method: "GET",
-      headers: { authorization: `Bearer ${bearerToken}` },
-      cache: "no-store",
-    });
-
-    if (!response.ok) {
-      throw new Error(`Monetica sales request failed with status ${response.status} for ${day}`);
+    if (
+      !options?.force &&
+      hasBootstrapedData &&
+      lastSyncedAt &&
+      Date.now() - new Date(lastSyncedAt).getTime() < throttleMs
+    ) {
+      const throttledFrom = parseDateOnly(defaultState?.syncedTo) ?? startOfUtcDay(latestImportedSaleDate ?? today);
+      return {
+        mode: "official",
+        propertyId,
+        importedSales: 0,
+        importedLines: 0,
+        skippedSales: 0,
+        skippedLines: 0,
+        warnings: [],
+        syncedFrom: formatDateOnly(throttledFrom),
+        syncedTo: formatDateOnly(today),
+        fetchedTransactions: 0,
+        fetchedDays: 0,
+        limitPerDay,
+        performedSync: false,
+        lastSyncedAt,
+      };
     }
 
-    const body: unknown = await response.json().catch(() => null);
-    const dayTransactions = extractMoneticaTransactions(body);
-    if (!dayTransactions) {
-      throw new Error(`Monetica sales response is not a valid transactions array for ${day}`);
-    }
+    if (!hasBootstrapedData) {
+      const bootstrapYears = await discoverBootstrapYears(propertyId, endpoint, bearerToken, today);
 
-    fetchedDays += 1;
-    fetchedTransactions.push(...dayTransactions);
+      if (bootstrapYears.length === 0) {
+        pushWarning(
+          warnings,
+          `Nessuna transazione Monetica trovata nello storico verificato fino all'anno ${await getBootstrapStartYear(propertyId, today)}.`,
+        );
+        return {
+          mode: "official",
+          propertyId,
+          importedSales: 0,
+          importedLines: 0,
+          skippedSales: 0,
+          skippedLines: 0,
+          warnings,
+          syncedFrom: formatDateOnly(today),
+          syncedTo: formatDateOnly(today),
+          fetchedTransactions: 0,
+          fetchedDays: 0,
+          limitPerDay,
+          performedSync: true,
+          lastSyncedAt: null,
+        };
+      }
 
-    if (dayTransactions.length >= limitPerDay) {
-      pushWarning(
+      syncedFrom = startOfUtcYear(bootstrapYears[0]);
+      syncedTo = today;
+
+      for (const year of bootstrapYears) {
+        const yearFrom = startOfUtcYear(year);
+        const yearTo = year === today.getUTCFullYear() ? today : endOfUtcYear(year);
+        const yearResult = await collectTransactionsByDay({
+          endpoint,
+          bearerToken,
+          from: yearFrom,
+          to: yearTo,
+          limitPerDay,
+          warnings,
+        });
+        fetchedTransactions.push(...yearResult.transactions);
+        fetchedDays += yearResult.fetchedDays;
+      }
+    } else {
+      syncedFrom = parseDateOnly(defaultState?.syncedTo) ?? startOfUtcDay(latestImportedSaleDate ?? today);
+      syncedTo = today;
+
+      const incrementalResult = await collectTransactionsByDay({
+        endpoint,
+        bearerToken,
+        from: syncedFrom,
+        to: syncedTo,
+        limitPerDay,
         warnings,
-        `Il giorno ${day} ha raggiunto il limite di ${limitPerDay} movimenti restituiti da Monetica; il risultato potrebbe essere parziale.`,
-      );
+      });
+      fetchedTransactions = incrementalResult.transactions;
+      fetchedDays = incrementalResult.fetchedDays;
     }
+  } else {
+    const explicitResult = await collectTransactionsByDay({
+      endpoint,
+      bearerToken,
+      from: range.from,
+      to: range.to,
+      limitPerDay,
+      warnings,
+    });
+    fetchedTransactions = explicitResult.transactions;
+    fetchedDays = explicitResult.fetchedDays;
   }
 
   const importResult = await importMoneticaTransactionsIntoProperty(propertyId, fetchedTransactions);
@@ -575,7 +793,7 @@ export async function syncOfficialMoneticaSales(
     pushWarning(mergedWarnings, warning);
   }
 
-  await upsertSyncState(propertyId, range.scope, formatDateOnly(range.from), formatDateOnly(range.to));
+  await upsertSyncState(propertyId, range.scope, formatDateOnly(syncedFrom), formatDateOnly(syncedTo));
   const updatedState = await getSyncState(propertyId, range.scope);
 
   return {
@@ -586,8 +804,8 @@ export async function syncOfficialMoneticaSales(
     skippedSales: importResult.skippedSales,
     skippedLines: importResult.skippedLines,
     warnings: mergedWarnings,
-    syncedFrom: formatDateOnly(range.from),
-    syncedTo: formatDateOnly(range.to),
+    syncedFrom: formatDateOnly(syncedFrom),
+    syncedTo: formatDateOnly(syncedTo),
     fetchedTransactions: fetchedTransactions.length,
     fetchedDays,
     limitPerDay,

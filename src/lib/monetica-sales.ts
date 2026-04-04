@@ -858,8 +858,8 @@ export async function syncOfficialMoneticaSales(
     bootstrapSyncedTo && bootstrapSyncedTo.getTime() < today.getTime(),
   );
   const shouldRunBootstrap =
-    !hasImportedSales &&
-    (Boolean(options?.allowHistoricalBootstrap) || bootstrapInProgress);
+    bootstrapInProgress ||
+    (!hasImportedSales && Boolean(options?.allowHistoricalBootstrap));
   const activeState = shouldRunBootstrap ? bootstrapState : incrementalState;
   const lastSyncedAt = activeState?.lastSyncedAt ?? null;
 
@@ -909,80 +909,124 @@ export async function syncOfficialMoneticaSales(
   }
 
   if (shouldRunBootstrap) {
-    const bootstrapChunk = await resolveBootstrapChunk({
-      propertyId,
-      today,
-      bootstrapState,
-      restart: Boolean(options?.force && !hasImportedSales && options?.allowHistoricalBootstrap),
-    });
-
-    if (!bootstrapChunk) {
-      return {
-        mode: "official",
-        propertyId,
-        importedSales: 0,
-        importedLines: 0,
-        skippedSales: 0,
-        skippedLines: 0,
-        warnings: [],
-        syncedFrom: formatDateOnly(today),
-        syncedTo: formatDateOnly(today),
-        fetchedTransactions: 0,
-        fetchedDays: 0,
-        limitPerDay,
-        performedSync: false,
-        lastSyncedAt,
-      };
-    }
-
-    const warnings: string[] = [];
     const bootstrapLimit = Math.min(Math.max(limitPerDay, DEFAULT_LIMIT_PER_DAY), DEFAULT_BOOTSTRAP_LIMIT);
-    const bootstrapFetched = await collectTransactionsByRange({
-      endpoint,
-      bearerToken,
-      from: bootstrapChunk.from,
-      to: bootstrapChunk.to,
-      limit: bootstrapLimit,
-      warnings,
-    });
-    const bootstrapTransactions = bootstrapFetched.transactions;
+    const runFullBootstrap = Boolean(options?.force && options?.allowHistoricalBootstrap);
+    let currentBootstrapState = bootstrapState;
+    let restartBootstrap = Boolean(options?.force && options?.allowHistoricalBootstrap);
+    let importedSales = 0;
+    let importedLines = 0;
+    let skippedSales = 0;
+    let skippedLines = 0;
+    let fetchedTransactions = 0;
+    let fetchedRanges = 0;
+    let processedAnyChunk = false;
+    let syncedFromLabel: string | null = null;
+    let syncedToLabel: string | null = null;
+    const mergedWarnings: string[] = [];
 
-    const importResult = await importMoneticaTransactionsIntoProperty(propertyId, bootstrapTransactions);
-    const mergedWarnings = [...importResult.warnings];
-    for (const warning of warnings) {
-      pushWarning(mergedWarnings, warning);
-    }
+    while (true) {
+      const bootstrapChunk = await resolveBootstrapChunk({
+        propertyId,
+        today,
+        bootstrapState: currentBootstrapState,
+        restart: restartBootstrap,
+      });
+      restartBootstrap = false;
 
-    await upsertSyncState(
-      propertyId,
-      DEFAULT_BOOTSTRAP_SCOPE,
-      formatDateOnly(bootstrapChunk.overallFrom),
-      formatDateOnly(bootstrapChunk.to),
-    );
-    if (bootstrapChunk.to.getTime() >= today.getTime()) {
+      if (!bootstrapChunk) {
+        if (!processedAnyChunk) {
+          return {
+            mode: "official",
+            propertyId,
+            importedSales: 0,
+            importedLines: 0,
+            skippedSales: 0,
+            skippedLines: 0,
+            warnings: [],
+            syncedFrom: formatDateOnly(today),
+            syncedTo: formatDateOnly(today),
+            fetchedTransactions: 0,
+            fetchedDays: 0,
+            limitPerDay,
+            performedSync: false,
+            lastSyncedAt,
+          };
+        }
+        break;
+      }
+
+      const warnings: string[] = [];
+      const bootstrapFetched = await collectTransactionsByRange({
+        endpoint,
+        bearerToken,
+        from: bootstrapChunk.from,
+        to: bootstrapChunk.to,
+        limit: bootstrapLimit,
+        warnings,
+      });
+      const importResult = await importMoneticaTransactionsIntoProperty(propertyId, bootstrapFetched.transactions);
+
+      importedSales += importResult.importedSales;
+      importedLines += importResult.importedLines;
+      skippedSales += importResult.skippedSales;
+      skippedLines += importResult.skippedLines;
+      fetchedTransactions += bootstrapFetched.transactions.length;
+      fetchedRanges += bootstrapFetched.fetchedRanges;
+      processedAnyChunk = true;
+      syncedFromLabel ??= formatDateOnly(bootstrapChunk.overallFrom);
+      syncedToLabel = formatDateOnly(bootstrapChunk.to);
+
+      for (const warning of importResult.warnings) {
+        pushWarning(mergedWarnings, warning);
+      }
+      for (const warning of warnings) {
+        pushWarning(mergedWarnings, warning);
+      }
+
       await upsertSyncState(
         propertyId,
-        DEFAULT_SYNC_SCOPE,
+        DEFAULT_BOOTSTRAP_SCOPE,
         formatDateOnly(bootstrapChunk.overallFrom),
         formatDateOnly(bootstrapChunk.to),
       );
+
+      currentBootstrapState = {
+        syncedFrom: formatDateOnly(bootstrapChunk.overallFrom),
+        syncedTo: formatDateOnly(bootstrapChunk.to),
+        lastSyncedAt: new Date(),
+      };
+
+      if (bootstrapChunk.to.getTime() >= today.getTime()) {
+        await upsertSyncState(
+          propertyId,
+          DEFAULT_SYNC_SCOPE,
+          formatDateOnly(bootstrapChunk.overallFrom),
+          formatDateOnly(bootstrapChunk.to),
+        );
+        break;
+      }
+
+      if (!runFullBootstrap) {
+        break;
+      }
     }
+
     const updatedState = await getSyncState(propertyId, DEFAULT_BOOTSTRAP_SCOPE);
 
     return {
       mode: "official",
       propertyId,
-      importedSales: importResult.importedSales,
-      importedLines: importResult.importedLines,
-      skippedSales: importResult.skippedSales,
-      skippedLines: importResult.skippedLines,
+      importedSales,
+      importedLines,
+      skippedSales,
+      skippedLines,
       warnings: mergedWarnings,
-      syncedFrom: formatDateOnly(bootstrapChunk.from),
-      syncedTo: formatDateOnly(bootstrapChunk.to),
-      fetchedTransactions: bootstrapTransactions.length,
-      fetchedDays: bootstrapFetched.fetchedRanges,
+      syncedFrom: syncedFromLabel ?? formatDateOnly(today),
+      syncedTo: syncedToLabel ?? formatDateOnly(today),
+      fetchedTransactions,
+      fetchedDays: fetchedRanges,
       limitPerDay: bootstrapLimit,
-      performedSync: true,
+      performedSync: processedAnyChunk,
       lastSyncedAt: updatedState?.lastSyncedAt ?? new Date(),
     };
   }

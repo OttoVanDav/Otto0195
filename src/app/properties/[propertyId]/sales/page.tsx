@@ -88,6 +88,7 @@ export default async function SalesPage({ params, searchParams }: Props) {
     ? await syncOfficialMoneticaSales(propertyId, {
         from: filterFrom ?? undefined,
         to: filterTo ?? undefined,
+        allowHistoricalBootstrap: false,
       }).catch(() => null)
     : null;
 
@@ -237,7 +238,7 @@ export default async function SalesPage({ params, searchParams }: Props) {
   const periodLabel = hasDateFilter ? formatPeriodLabel(filterFrom, filterTo) : `Intero anno ${year}`;
   const autoSyncLabel = hasDateFilter
     ? `il periodo filtrato viene letto subito dal database; se vuoi riallinearlo con Monetica usa "Sincronizza vendite"`
-    : "al primo import viene acquisito tutto lo storico disponibile; poi vengono riallineate solo le nuove transazioni";
+    : "dopo la prima sincronizzazione manuale vengono riallineate automaticamente solo le nuove transazioni";
 
   async function createManualSale(formData: FormData) {
     "use server";
@@ -298,6 +299,7 @@ export default async function SalesPage({ params, searchParams }: Props) {
       from: filterFrom ?? undefined,
       to: filterTo ?? undefined,
       force: true,
+      allowHistoricalBootstrap: true,
     }).catch(() => null);
 
     revalidatePath(`/properties/${propertyId}/sales`);
@@ -443,7 +445,7 @@ export default async function SalesPage({ params, searchParams }: Props) {
                   <li><code>pos_name</code> viene allineato ai nomi interni anche quando Monetica usa alias come <code>Chalet mare</code> per <code>Bar Del Mare</code>.</li>
                   <li><code>transaction_items[].sku</code> deve essere mappato nella pagina prodotti come Mapping Monetica.</li>
                   <li>La sync ufficiale salva gli scontrini raggruppati per <code>transaction_id</code> e non duplica le vendite gia registrate.</li>
-                  <li>Senza filtro data, se il database vendite Monetica e vuoto viene importato tutto lo storico disponibile; dalle sync successive vengono richieste solo le transazioni nuove.</li>
+                  <li>Senza filtro data, se il database vendite Monetica e vuoto il primo bootstrap storico completo avviene con il bottone <code>Sincronizza vendite</code>; dalle sync successive vengono richieste solo le transazioni nuove.</li>
                   <li>Con un filtro data esteso la pagina mostra subito lo storico gia importato nel DB; il bottone <code>Sincronizza vendite</code> aggiorna esplicitamente quel periodo.</li>
                 </ul>
               </div>

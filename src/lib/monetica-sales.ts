@@ -32,6 +32,11 @@ type SaleLineInput = {
   unitPriceNet: number;
 };
 
+type ResolvedSaleSkuAlias = {
+  externalSku: string;
+  productId: string;
+};
+
 export type ImportMoneticaSalesResult = {
   propertyId: string;
   importedSales: number;
@@ -154,10 +159,6 @@ function startOfUtcYear(year: number) {
   return new Date(Date.UTC(year, 0, 1));
 }
 
-function endOfUtcYear(year: number) {
-  return new Date(Date.UTC(year, 11, 31));
-}
-
 function startOfUtcDay(date: Date) {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
 }
@@ -210,11 +211,14 @@ function resolveOutletCandidateKeys(transaction: MoneticaTransaction) {
 function parseMoneticaLines(
   transaction: MoneticaTransaction,
   productMap: Map<string, string>,
+  productIdByName: Map<string, string>,
+  ambiguousProductNames: Set<string>,
   warnings: string[],
 ) {
   const rawItems = Array.isArray(transaction.transaction_items) ? transaction.transaction_items : [];
   const transactionRef = asString(transaction.transaction_id) ?? asString(transaction.id) ?? "n/a";
   const lines: SaleLineInput[] = [];
+  const resolvedAliases: ResolvedSaleSkuAlias[] = [];
   let skippedLines = 0;
 
   for (const item of rawItems) {
@@ -248,7 +252,15 @@ function parseMoneticaLines(
       continue;
     }
 
-    const productId = productMap.get(externalSku);
+    const itemName = asString(item.name);
+    const normalizedItemName = itemName ? normalizeKey(itemName) : null;
+    let productId = productMap.get(externalSku) ?? null;
+    if (!productId && normalizedItemName && !ambiguousProductNames.has(normalizedItemName)) {
+      productId = productIdByName.get(normalizedItemName) ?? null;
+      if (productId) {
+        resolvedAliases.push({ externalSku, productId });
+      }
+    }
     if (!productId) {
       skippedLines += 1;
       pushWarning(warnings, `Transazione ${transactionRef}: SKU ${externalSku} non mappato su un prodotto interno.`);
@@ -258,7 +270,7 @@ function parseMoneticaLines(
     lines.push({ productId, qty, unitPriceNet });
   }
 
-  return { lines, skippedLines };
+  return { lines, skippedLines, resolvedAliases };
 }
 
 export function extractMoneticaTransactions(value: unknown): MoneticaTransaction[] | null {
@@ -478,27 +490,6 @@ async function collectTransactionsByDay(args: {
   return { transactions, fetchedDays };
 }
 
-async function discoverBootstrapYears(
-  propertyId: string,
-  endpoint: string,
-  bearerToken: string,
-  today: Date,
-) {
-  const bootstrapStartYear = await getBootstrapStartYear(propertyId, today);
-  const years: number[] = [];
-
-  for (let year = today.getUTCFullYear(); year >= bootstrapStartYear; year -= 1) {
-    const from = startOfUtcYear(year);
-    const to = year === today.getUTCFullYear() ? today : endOfUtcYear(year);
-    const probeTransactions = await fetchMoneticaTransactionsForRange(endpoint, bearerToken, from, to, 1);
-    if (probeTransactions.length > 0) {
-      years.push(year);
-    }
-  }
-
-  return years.sort((a, b) => a - b);
-}
-
 export async function importMoneticaTransactionsIntoProperty(
   propertyId: string,
   transactions: MoneticaTransaction[],
@@ -514,6 +505,25 @@ export async function importMoneticaTransactionsIntoProperty(
   for (const outlet of property.outlets) {
     outletByName.set(normalizeKey(outlet.name), { id: outlet.id, name: outlet.name });
   }
+
+  const products = await prisma.product.findMany({
+    where: { orgId: property.orgId },
+    select: { id: true, name: true },
+  });
+  const productNameCounts = new Map<string, number>();
+  const productIdByName = new Map<string, string>();
+  for (const product of products) {
+    const key = normalizeKey(product.name);
+    productNameCounts.set(key, (productNameCounts.get(key) ?? 0) + 1);
+    if (!productIdByName.has(key)) {
+      productIdByName.set(key, product.id);
+    }
+  }
+  const ambiguousProductNames = new Set(
+    [...productNameCounts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([name]) => name),
+  );
 
   const externalMaps = await prisma.externalProductMap.findMany({
     where: { orgId: property.orgId, source: MONETICA_SALES_SOURCE },
@@ -575,7 +585,13 @@ export async function importMoneticaTransactionsIntoProperty(
       fiscalYearCache.set(saleDate.getUTCFullYear(), fiscalYear);
     }
 
-    const parsed = parseMoneticaLines(transaction, productMap, warnings);
+    const parsed = parseMoneticaLines(
+      transaction,
+      productMap,
+      productIdByName,
+      ambiguousProductNames,
+      warnings,
+    );
     skippedLines += parsed.skippedLines;
     if (parsed.lines.length === 0) {
       skippedSales += 1;
@@ -616,6 +632,27 @@ export async function importMoneticaTransactionsIntoProperty(
       })),
     });
 
+    for (const alias of parsed.resolvedAliases) {
+      if (productMap.get(alias.externalSku) === alias.productId) continue;
+      await prisma.externalProductMap.upsert({
+        where: {
+          orgId_source_externalSku: {
+            orgId: property.orgId,
+            source: MONETICA_SALES_SOURCE,
+            externalSku: alias.externalSku,
+          },
+        },
+        update: { productId: alias.productId },
+        create: {
+          orgId: property.orgId,
+          source: MONETICA_SALES_SOURCE,
+          externalSku: alias.externalSku,
+          productId: alias.productId,
+        },
+      });
+      productMap.set(alias.externalSku, alias.productId);
+    }
+
     importedSales += 1;
     importedLines += parsed.lines.length;
   }
@@ -638,6 +675,7 @@ export async function syncOfficialMoneticaSales(
     force?: boolean;
     limitPerDay?: number;
     throttleMs?: number;
+    allowHistoricalBootstrap?: boolean;
   },
 ): Promise<SyncOfficialMoneticaSalesResult> {
   const endpoint = process.env.MONETICA_TRANSACTIONS_URL?.trim();
@@ -717,13 +755,7 @@ export async function syncOfficialMoneticaSales(
     }
 
     if (!hasBootstrapedData) {
-      const bootstrapYears = await discoverBootstrapYears(propertyId, endpoint, bearerToken, today);
-
-      if (bootstrapYears.length === 0) {
-        pushWarning(
-          warnings,
-          `Nessuna transazione Monetica trovata nello storico verificato fino all'anno ${await getBootstrapStartYear(propertyId, today)}.`,
-        );
+      if (!options?.allowHistoricalBootstrap) {
         return {
           mode: "official",
           propertyId,
@@ -731,33 +763,50 @@ export async function syncOfficialMoneticaSales(
           importedLines: 0,
           skippedSales: 0,
           skippedLines: 0,
-          warnings,
+          warnings: [],
           syncedFrom: formatDateOnly(today),
           syncedTo: formatDateOnly(today),
           fetchedTransactions: 0,
           fetchedDays: 0,
           limitPerDay,
-          performedSync: true,
+          performedSync: false,
           lastSyncedAt: null,
         };
       }
 
-      syncedFrom = startOfUtcYear(bootstrapYears[0]);
+      const bootstrapStartYear = await getBootstrapStartYear(propertyId, today);
+      syncedFrom = startOfUtcYear(bootstrapStartYear);
       syncedTo = today;
 
-      for (const year of bootstrapYears) {
-        const yearFrom = startOfUtcYear(year);
-        const yearTo = year === today.getUTCFullYear() ? today : endOfUtcYear(year);
-        const yearResult = await collectTransactionsByDay({
-          endpoint,
-          bearerToken,
-          from: yearFrom,
-          to: yearTo,
-          limitPerDay,
-          warnings,
-        });
-        fetchedTransactions.push(...yearResult.transactions);
-        fetchedDays += yearResult.fetchedDays;
+      for (
+        let year = bootstrapStartYear;
+        year <= today.getUTCFullYear();
+        year += 1
+      ) {
+        for (let month = 0; month < 12; month += 1) {
+          const monthFrom = new Date(Date.UTC(year, month, 1));
+          if (monthFrom.getTime() > today.getTime()) break;
+
+          const monthTo = new Date(Date.UTC(year, month + 1, 0));
+          const boundedMonthTo = monthTo.getTime() > today.getTime() ? today : monthTo;
+          const monthTransactions = await fetchMoneticaTransactionsForRange(
+            endpoint,
+            bearerToken,
+            monthFrom,
+            boundedMonthTo,
+            Math.max(limitPerDay, 20000),
+          );
+
+          fetchedDays += 1;
+          fetchedTransactions.push(...monthTransactions);
+
+          if (monthTransactions.length >= Math.max(limitPerDay, 20000)) {
+            pushWarning(
+              warnings,
+              `Il periodo ${formatDateOnly(monthFrom)}:${formatDateOnly(boundedMonthTo)} ha raggiunto il limite di ${Math.max(limitPerDay, 20000)} movimenti restituiti da Monetica; il risultato potrebbe essere parziale.`,
+            );
+          }
+        }
       }
     } else {
       syncedFrom = parseDateOnly(defaultState?.syncedTo) ?? startOfUtcDay(latestImportedSaleDate ?? today);

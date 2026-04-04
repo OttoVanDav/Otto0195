@@ -322,6 +322,7 @@ export default async function SalesPage({ params, searchParams }: Props) {
       );
     }
 
+    let redirectHref = "";
     try {
       const result = await syncOfficialMoneticaSales(propertyId, {
         from: filterFrom ?? undefined,
@@ -339,38 +340,36 @@ export default async function SalesPage({ params, searchParams }: Props) {
         ? `Sync completata: ${result.importedSales} scontrini importati, ${result.skippedSales} scartati.`
         : "Nessuna nuova transazione da sincronizzare in questo momento.";
 
-      redirect(
-        buildSalesPageHref({
-          propertyId,
-          year,
-          outletId: outletFilter,
-          fromOutletId,
-          from: rawFrom,
-          to: rawTo,
-          sync: result.performedSync ? "ok" : "idle",
-          syncMessage: successMessage,
-          syncImported: String(result.importedSales),
-          syncSkipped: String(result.skippedSales),
-          syncFetched: String(result.fetchedTransactions),
-          syncFrom: result.syncedFrom,
-          syncTo: result.syncedTo,
-        }),
-      );
+      redirectHref = buildSalesPageHref({
+        propertyId,
+        year,
+        outletId: outletFilter,
+        fromOutletId,
+        from: rawFrom,
+        to: rawTo,
+        sync: result.performedSync ? "ok" : "idle",
+        syncMessage: successMessage,
+        syncImported: String(result.importedSales),
+        syncSkipped: String(result.skippedSales),
+        syncFetched: String(result.fetchedTransactions),
+        syncFrom: result.syncedFrom,
+        syncTo: result.syncedTo,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Sync Monetica fallita.";
-      redirect(
-        buildSalesPageHref({
-          propertyId,
-          year,
-          outletId: outletFilter,
-          fromOutletId,
-          from: rawFrom,
-          to: rawTo,
-          sync: "error",
-          syncMessage: message,
-        }),
-      );
+      redirectHref = buildSalesPageHref({
+        propertyId,
+        year,
+        outletId: outletFilter,
+        fromOutletId,
+        from: rawFrom,
+        to: rawTo,
+        sync: "error",
+        syncMessage: message,
+      });
     }
+
+    redirect(redirectHref);
   }
 
   return (

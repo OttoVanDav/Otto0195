@@ -727,11 +727,11 @@ export async function syncOfficialMoneticaSales(
   if (!hasExplicitRange) {
     const latestImportedSaleDate = await getLatestImportedMoneticaSaleDate(propertyId);
     const defaultState = existingState;
-    const hasBootstrapedData = Boolean(defaultState || latestImportedSaleDate);
+    const hasImportedSales = Boolean(latestImportedSaleDate);
 
     if (
       !options?.force &&
-      hasBootstrapedData &&
+      hasImportedSales &&
       lastSyncedAt &&
       Date.now() - new Date(lastSyncedAt).getTime() < throttleMs
     ) {
@@ -754,7 +754,7 @@ export async function syncOfficialMoneticaSales(
       };
     }
 
-    if (!hasBootstrapedData) {
+    if (!hasImportedSales) {
       if (!options?.allowHistoricalBootstrap) {
         return {
           mode: "official",

@@ -11,7 +11,7 @@ import { listPropertySuppliers } from "@/lib/suppliers";
 
 type Props = {
   params: Promise<{ propertyId: string }>;
-  searchParams?: Promise<{ year?: string; fromOutletId?: string }>;
+  searchParams?: Promise<{ year?: string; fromOutletId?: string; productId?: string; supplierId?: string }>;
 };
 
 type SharedCostRow = {
@@ -38,6 +38,8 @@ export default async function PropertyCostsPage({ params, searchParams }: Props)
   const sp = searchParams ? await searchParams : {};
   const year = Number(sp.year ?? new Date().getUTCFullYear());
   const fromOutletId = String(sp.fromOutletId ?? "");
+  const selectedProductId = String(sp.productId ?? "").trim();
+  const selectedSupplierId = String(sp.supplierId ?? "").trim();
 
   const property = await prisma.property.findUnique({
     where: { id: propertyId },
@@ -59,9 +61,16 @@ export default async function PropertyCostsPage({ params, searchParams }: Props)
   const hasSuppliers = suppliers.length > 0;
   const rawCosts = await listOutletCostsForOutlets(barOutletIds, visibleYears);
   const costs = buildSharedCosts(rawCosts, barOutletIds.length, year);
+  const filteredCosts = costs.filter((row) => {
+    if (selectedProductId && row.productId !== selectedProductId) return false;
+    if (selectedSupplierId && row.supplierId !== selectedSupplierId) return false;
+    return true;
+  });
   const historyRows = buildCostHistoryRows(rawCosts, barOutletIds.length, visibleYears);
   const yearChoices = buildYearChoices(year);
   const distinctProductCount = new Set(costs.map((row) => row.productId)).size;
+  const costFilterProducts = buildCostFilterProducts(costs);
+  const costFilterSuppliers = buildCostFilterSuppliers(costs);
 
   const hasFromOutlet = barOutlets.some((outlet) => outlet.id === fromOutletId);
   const backHref = hasFromOutlet
@@ -101,7 +110,55 @@ export default async function PropertyCostsPage({ params, searchParams }: Props)
     ).catch(() => null);
 
     revalidateStructureCosts(propertyId, selectedYear, barOutletIds);
-    redirect(`/properties/${propertyId}/costs?year=${selectedYear}${hasFromOutlet ? `&fromOutletId=${fromOutletId}` : ""}`);
+    redirect(buildCostsPageHref({
+      propertyId,
+      year: selectedYear,
+      fromOutletId: hasFromOutlet ? fromOutletId : "",
+      productId: selectedProductId,
+      supplierId: selectedSupplierId,
+    }));
+  }
+
+  async function updateConfiguredCost(formData: FormData) {
+    "use server";
+    const productId = String(formData.get("productId") ?? "").trim();
+    const selectedYear = Number(formData.get("year") ?? year);
+    const supplierIdRaw = String(formData.get("supplierId") ?? "").trim();
+    const supplierId = supplierIdRaw || null;
+    const unitCostNetMin = parseNumberInput(formData.get("unitCostNetMin"));
+    const unitCostNetMax = parseNumberInput(formData.get("unitCostNetMax"));
+    const note = String(formData.get("note") ?? "").trim();
+
+    if (
+      !productId ||
+      !Number.isFinite(selectedYear) ||
+      !Number.isFinite(unitCostNetMin) ||
+      !Number.isFinite(unitCostNetMax) ||
+      unitCostNetMin < 0 ||
+      unitCostNetMax < 0 ||
+      unitCostNetMin > unitCostNetMax
+    ) {
+      return;
+    }
+
+    await upsertOutletCosts(
+      barOutletIds,
+      productId,
+      selectedYear,
+      unitCostNetMin,
+      unitCostNetMax,
+      note || null,
+      supplierId,
+    ).catch(() => null);
+
+    revalidateStructureCosts(propertyId, selectedYear, barOutletIds);
+    redirect(buildCostsPageHref({
+      propertyId,
+      year: selectedYear,
+      fromOutletId: hasFromOutlet ? fromOutletId : "",
+      productId: selectedProductId,
+      supplierId: selectedSupplierId,
+    }));
   }
 
   async function removeCost(formData: FormData) {
@@ -113,7 +170,13 @@ export default async function PropertyCostsPage({ params, searchParams }: Props)
 
     await deleteOutletCostsByProductSupplier(barOutletIds, productId, year, supplierId).catch(() => null);
     revalidateStructureCosts(propertyId, year, barOutletIds);
-    redirect(`/properties/${propertyId}/costs?year=${year}${hasFromOutlet ? `&fromOutletId=${fromOutletId}` : ""}`);
+    redirect(buildCostsPageHref({
+      propertyId,
+      year,
+      fromOutletId: hasFromOutlet ? fromOutletId : "",
+      productId: selectedProductId,
+      supplierId: selectedSupplierId,
+    }));
   }
 
   return (
@@ -132,7 +195,13 @@ export default async function PropertyCostsPage({ params, searchParams }: Props)
               {yearChoices.map((choice) => (
                 <Link
                   key={choice}
-                  href={`/properties/${propertyId}/costs?year=${choice}${hasFromOutlet ? `&fromOutletId=${fromOutletId}` : ""}`}
+                  href={buildCostsPageHref({
+                    propertyId,
+                    year: choice,
+                    fromOutletId: hasFromOutlet ? fromOutletId : "",
+                    productId: selectedProductId,
+                    supplierId: selectedSupplierId,
+                  })}
                   className={`rounded-lg px-3 py-1.5 text-sm font-medium transition ${
                     choice === year ? "bg-zinc-900 text-white shadow-sm" : "text-zinc-700 hover:bg-zinc-50"
                   }`}
@@ -246,6 +315,42 @@ export default async function PropertyCostsPage({ params, searchParams }: Props)
           <div className="mt-2 text-sm text-zinc-600">
             Ogni modifica aggiorna automaticamente tutti i bar della struttura.
           </div>
+          <form action={`/properties/${propertyId}/costs`} method="get" className="mt-4 grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto]">
+            <input type="hidden" name="year" value={String(year)} />
+            {hasFromOutlet ? <input type="hidden" name="fromOutletId" value={fromOutletId} /> : null}
+            <select name="productId" defaultValue={selectedProductId} className="rounded-xl border px-3 py-2 text-sm">
+              <option value="">Tutti i prodotti</option>
+              {costFilterProducts.map((product) => (
+                <option key={product.id} value={product.id}>
+                  {product.name}
+                </option>
+              ))}
+            </select>
+            <select name="supplierId" defaultValue={selectedSupplierId} className="rounded-xl border px-3 py-2 text-sm">
+              <option value="">Tutti i fornitori</option>
+              {costFilterSuppliers.map((supplier) => (
+                <option key={supplier.id} value={supplier.id}>
+                  {supplier.name}
+                </option>
+              ))}
+            </select>
+            <button className="rounded-xl border border-zinc-200 bg-white px-4 py-2 text-sm font-semibold text-zinc-700 hover:bg-zinc-100">
+              Applica filtri
+            </button>
+            <Link
+              href={buildCostsPageHref({
+                propertyId,
+                year,
+                fromOutletId: hasFromOutlet ? fromOutletId : "",
+              })}
+              className="rounded-xl border border-zinc-200 bg-white px-4 py-2 text-center text-sm font-semibold text-zinc-700 hover:bg-zinc-100"
+            >
+              Reset
+            </Link>
+          </form>
+          <div className="mt-3 text-xs text-zinc-500">
+            Risultati mostrati: {filteredCosts.length} di {costs.length}.
+          </div>
           <div className="mt-4 overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-zinc-50 text-left">
@@ -262,12 +367,38 @@ export default async function PropertyCostsPage({ params, searchParams }: Props)
                 </tr>
               </thead>
               <tbody>
-                {costs.map((cost) => (
+                {filteredCosts.map((cost) => (
                   <tr key={cost.key} className="border-t">
                     <td className="px-3 py-2 font-medium">{cost.productName}</td>
                     <td className="px-3 py-2 text-zinc-600">{cost.supplierName ?? "-"}</td>
-                    <td className="px-3 py-2">{money(cost.unitCostNetMin)} / {cost.uom}</td>
-                    <td className="px-3 py-2">{money(cost.unitCostNetMax)} / {cost.uom}</td>
+                    <td className="px-3 py-2">
+                      <div className="flex items-center gap-2">
+                        <input
+                          form={`update-cost-${cost.key}`}
+                          name="unitCostNetMin"
+                          type="number"
+                          min="0"
+                          step="0.001"
+                          defaultValue={formatCostInput(cost.unitCostNetMin)}
+                          className="w-28 rounded-lg border px-2 py-1 text-sm"
+                        />
+                        <span className="text-zinc-500">/ {cost.uom}</span>
+                      </div>
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="flex items-center gap-2">
+                        <input
+                          form={`update-cost-${cost.key}`}
+                          name="unitCostNetMax"
+                          type="number"
+                          min="0"
+                          step="0.001"
+                          defaultValue={formatCostInput(cost.unitCostNetMax)}
+                          className="w-28 rounded-lg border px-2 py-1 text-sm"
+                        />
+                        <span className="text-zinc-500">/ {cost.uom}</span>
+                      </div>
+                    </td>
                     <td className="px-3 py-2 font-medium">{money(cost.unitCostNetAvg)} / {cost.uom}</td>
                     <td className="px-3 py-2 text-zinc-600">{cost.note ?? "-"}</td>
                     <td className="px-3 py-2 text-zinc-600">
@@ -275,20 +406,36 @@ export default async function PropertyCostsPage({ params, searchParams }: Props)
                     </td>
                     <td className="px-3 py-2 text-zinc-600">{new Date(cost.updatedAt).toLocaleString("it-IT")}</td>
                     <td className="px-3 py-2">
-                      <form action={removeCost}>
-                        <input type="hidden" name="productId" value={cost.productId} />
-                        <input type="hidden" name="supplierId" value={cost.supplierId ?? ""} />
-                        <button className="rounded-lg border border-red-200 px-2 py-1 text-xs font-semibold text-red-700 hover:bg-red-50">
-                          Rimuovi
+                      <div className="flex flex-wrap gap-2">
+                        <form id={`update-cost-${cost.key}`} action={updateConfiguredCost}>
+                          <input type="hidden" name="productId" value={cost.productId} />
+                          <input type="hidden" name="supplierId" value={cost.supplierId ?? ""} />
+                          <input type="hidden" name="year" value={String(cost.year)} />
+                          <input type="hidden" name="note" value={cost.note ?? ""} />
+                        </form>
+                        <button
+                          form={`update-cost-${cost.key}`}
+                          className="rounded-lg border border-zinc-200 px-2 py-1 text-xs font-semibold text-zinc-700 hover:bg-zinc-50"
+                        >
+                          Aggiorna
                         </button>
-                      </form>
+                        <form action={removeCost}>
+                          <input type="hidden" name="productId" value={cost.productId} />
+                          <input type="hidden" name="supplierId" value={cost.supplierId ?? ""} />
+                          <button className="rounded-lg border border-red-200 px-2 py-1 text-xs font-semibold text-red-700 hover:bg-red-50">
+                            Rimuovi
+                          </button>
+                        </form>
+                      </div>
                     </td>
                   </tr>
                 ))}
-                {costs.length === 0 && (
+                {filteredCosts.length === 0 && (
                   <tr>
                     <td className="px-3 py-6 text-zinc-500" colSpan={9}>
-                      Nessun costo merce impostato per i bar della struttura nel {year}.
+                      {selectedProductId || selectedSupplierId
+                        ? `Nessun costo merce trovato per i filtri selezionati nel ${year}.`
+                        : `Nessun costo merce impostato per i bar della struttura nel ${year}.`}
                     </td>
                   </tr>
                 )}
@@ -396,6 +543,40 @@ function revalidateStructureCosts(propertyId: string, year: number, barOutletIds
   }
 }
 
+function buildCostsPageHref(args: {
+  propertyId: string;
+  year: number;
+  fromOutletId?: string;
+  productId?: string;
+  supplierId?: string;
+}) {
+  const params = new URLSearchParams();
+  params.set("year", String(args.year));
+  if (args.fromOutletId) params.set("fromOutletId", args.fromOutletId);
+  if (args.productId) params.set("productId", args.productId);
+  if (args.supplierId) params.set("supplierId", args.supplierId);
+  return `/properties/${args.propertyId}/costs?${params.toString()}`;
+}
+
+function buildCostFilterProducts(costs: SharedCostRow[]) {
+  const products = new Map<string, { id: string; name: string }>();
+  for (const cost of costs) {
+    if (!products.has(cost.productId)) {
+      products.set(cost.productId, { id: cost.productId, name: cost.productName });
+    }
+  }
+  return [...products.values()].sort((a, b) => a.name.localeCompare(b.name, "it"));
+}
+
+function buildCostFilterSuppliers(costs: SharedCostRow[]) {
+  const suppliers = new Map<string, { id: string; name: string }>();
+  for (const cost of costs) {
+    if (!cost.supplierId || !cost.supplierName || suppliers.has(cost.supplierId)) continue;
+    suppliers.set(cost.supplierId, { id: cost.supplierId, name: cost.supplierName });
+  }
+  return [...suppliers.values()].sort((a, b) => a.name.localeCompare(b.name, "it"));
+}
+
 function StatCard({ title, value }: { title: string; value: string }) {
   return (
     <div className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
@@ -418,6 +599,10 @@ function parseNumberInput(value: FormDataEntryValue | null) {
   const raw = String(value ?? "").trim();
   if (!raw) return Number.NaN;
   return Number(raw.replace(",", "."));
+}
+
+function formatCostInput(value: number) {
+  return Number(value).toFixed(3);
 }
 
 function buildYearChoices(year: number) {

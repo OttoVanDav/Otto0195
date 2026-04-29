@@ -63,6 +63,7 @@ export default async function ProductsPage({ params, searchParams }: Props) {
     const priceCategory = String(formData.get("priceCategory") ?? "STANDARD").trim().toUpperCase();
     const defaultSalePriceNet = Number(formData.get("defaultSalePriceNet") ?? 0);
     const trackShrinkageBar = formData.get("trackShrinkageBar") === "on";
+    const excludeFromAvgTicketAndSalesCount = formData.get("excludeFromAvgTicketAndSalesCount") === "on";
     if (!name) return;
     if (!Number.isFinite(defaultSalePriceNet) || defaultSalePriceNet < 0) return;
 
@@ -75,11 +76,13 @@ export default async function ProductsPage({ params, searchParams }: Props) {
         priceCategory: priceCategory || "STANDARD",
         defaultSalePriceNet,
         trackShrinkageBar,
+        excludeFromAvgTicketAndSalesCount,
       },
     });
 
     revalidatePath(`/properties/${propertyId}/products?year=${year}`);
     revalidatePath(`/properties/${propertyId}/inventory?year=${year}`);
+    revalidatePath(`/properties/${propertyId}/analytics?year=${year}`);
   }
 
   async function toggleShrinkage(formData: FormData) {
@@ -95,6 +98,21 @@ export default async function ProductsPage({ params, searchParams }: Props) {
 
     revalidatePath(`/properties/${propertyId}/products?year=${year}`);
     revalidatePath(`/properties/${propertyId}/inventory?year=${year}`);
+  }
+
+  async function toggleReceiptMetricsExclusion(formData: FormData) {
+    "use server";
+    const id = String(formData.get("id") ?? "");
+    const value = String(formData.get("value") ?? "false") === "true";
+    if (!id) return;
+
+    await prisma.product.update({
+      where: { id },
+      data: { excludeFromAvgTicketAndSalesCount: value },
+    });
+
+    revalidatePath(`/properties/${propertyId}/products?year=${year}`);
+    revalidatePath(`/properties/${propertyId}/analytics?year=${year}`);
   }
 
   async function upsertMoneticaMap(formData: FormData) {
@@ -132,6 +150,7 @@ export default async function ProductsPage({ params, searchParams }: Props) {
     await prisma.product.delete({ where: { id } }).catch(() => null);
 
     revalidatePath(`/properties/${propertyId}/products?year=${year}`);
+    revalidatePath(`/properties/${propertyId}/analytics?year=${year}`);
   }
 
   async function updatePriceConfig(formData: FormData) {
@@ -224,7 +243,7 @@ export default async function ProductsPage({ params, searchParams }: Props) {
 
         <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
           <h2 className="text-lg font-semibold text-zinc-900">Nuovo prodotto</h2>
-          <form action={createProduct} className="mt-4 grid gap-2 md:grid-cols-8">
+          <form action={createProduct} className="mt-4 grid gap-2 md:grid-cols-10">
             <input name="name" required placeholder="Nome prodotto" className="md:col-span-2 rounded-xl border px-3 py-2 text-sm" />
             <input name="sku" placeholder="SKU interno" className="rounded-xl border px-3 py-2 text-sm" />
             <input name="uom" defaultValue="PZ" placeholder="U.M." className="rounded-xl border px-3 py-2 text-sm" />
@@ -234,8 +253,15 @@ export default async function ProductsPage({ params, searchParams }: Props) {
               <input type="checkbox" name="trackShrinkageBar" />
               Track shrinkage bar
             </label>
+            <label className="flex items-center gap-2 rounded-xl border px-3 py-2 text-sm md:col-span-2">
+              <input type="checkbox" name="excludeFromAvgTicketAndSalesCount" />
+              Escludi da scontrino medio e N. vendite
+            </label>
             <button className="rounded-xl bg-zinc-900 px-4 py-2 text-sm font-semibold text-white hover:bg-zinc-800">Aggiungi</button>
           </form>
+          <div className="mt-3 rounded-xl border border-zinc-200 bg-zinc-50/40 px-3 py-2 text-xs text-zinc-600">
+            I prodotti esclusi da questi due KPI continuano a contribuire a ricavi, margini, costi e a tutte le altre sezioni della pagina analytics.
+          </div>
         </section>
 
         <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
@@ -251,6 +277,7 @@ export default async function ProductsPage({ params, searchParams }: Props) {
                   <th className="px-3 py-2">Prezzo Monetica {year}</th>
                   <th className="px-3 py-2">Prezzo base</th>
                   <th className="px-3 py-2">Shrinkage bar</th>
+                  <th className="px-3 py-2">KPI ticket</th>
                   <th className="px-3 py-2">Mapping Monetica</th>
                   <th className="px-3 py-2">Azioni</th>
                 </tr>
@@ -294,6 +321,15 @@ export default async function ProductsPage({ params, searchParams }: Props) {
                       </form>
                     </td>
                     <td className="px-3 py-2">
+                      <form action={toggleReceiptMetricsExclusion} className="inline">
+                        <input type="hidden" name="id" value={p.id} />
+                        <input type="hidden" name="value" value={String(!p.excludeFromAvgTicketAndSalesCount)} />
+                        <button className={`rounded-lg px-2 py-1 text-xs font-semibold ${p.excludeFromAvgTicketAndSalesCount ? "bg-amber-100 text-amber-800" : "bg-zinc-100 text-zinc-700"}`}>
+                          {p.excludeFromAvgTicketAndSalesCount ? "Escluso" : "No"}
+                        </button>
+                      </form>
+                    </td>
+                    <td className="px-3 py-2">
                       <form action={upsertMoneticaMap} className="flex items-center gap-2">
                         <input type="hidden" name="productId" value={p.id} />
                         <input
@@ -315,7 +351,7 @@ export default async function ProductsPage({ params, searchParams }: Props) {
                 ))}
                 {products.length === 0 && (
                   <tr>
-                    <td className="px-3 py-6 text-sm text-zinc-500" colSpan={9}>
+                    <td className="px-3 py-6 text-sm text-zinc-500" colSpan={10}>
                       Nessun prodotto inserito.
                     </td>
                   </tr>

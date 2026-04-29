@@ -178,6 +178,7 @@ model Product {
   priceCategory     String   @default("STANDARD")
   defaultSalePriceNet Float  @default(0)
   trackShrinkageBar Boolean  @default(false)
+  excludeFromAvgTicketAndSalesCount Boolean @default(false)
   createdAt         DateTime @default(now())
 
   org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)

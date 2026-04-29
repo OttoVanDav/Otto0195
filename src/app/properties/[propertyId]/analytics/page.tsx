@@ -187,10 +187,15 @@ export default async function PropertyAnalyticsPage({ params, searchParams }: Pr
 
   const products = await prisma.product.findMany({
     where: { orgId: property.orgId },
-    select: { id: true, name: true, priceCategory: true, defaultSalePriceNet: true },
+    select: { id: true, name: true, priceCategory: true, defaultSalePriceNet: true, excludeFromAvgTicketAndSalesCount: true },
     orderBy: { name: "asc" },
   });
   const productInfoById = new Map(products.map((p) => [p.id, p]));
+  const excludedFromReceiptMetricsProductIds = new Set(
+    products
+      .filter((product) => product.excludeFromAvgTicketAndSalesCount)
+      .map((product) => product.id),
+  );
 
   const transferRows = await prisma.stockMoveLine.findMany({
     where: {
@@ -385,6 +390,7 @@ export default async function PropertyAnalyticsPage({ params, searchParams }: Pr
   let totalPurchaseVariance = 0;
   let totalPurchaseStandardCost = 0;
   const receiptOutletBySaleId = new Map<string, string>();
+  let receiptMetricsRevenue = 0;
 
   for (const p of products) {
     const defaultConfiguredPrice = year === currentUtcYear ? Number(p.defaultSalePriceNet) : 0;
@@ -439,7 +445,6 @@ export default async function PropertyAnalyticsPage({ params, searchParams }: Pr
     const qty = Number(r.qty);
     const actualUnitPriceGross = Number(r.unitPriceNet);
     const actualUnitPrice = grossToNetSaleUnitPrice(actualUnitPriceGross);
-    receiptOutletBySaleId.set(r.sale.id, r.sale.outletId);
     const targetUnitPrice = grossToNetSaleUnitPrice(Number(
       outletPriceMap.get(`${r.sale.outletId}:${r.productId}`) ??
       (year === currentUtcYear ? productInfoById.get(r.productId)?.defaultSalePriceNet : undefined) ??
@@ -454,6 +459,10 @@ export default async function PropertyAnalyticsPage({ params, searchParams }: Pr
     outlet.revenue += revenue;
     outlet.cogs += cogs;
     outlet.qtySold += qty;
+    if (!excludedFromReceiptMetricsProductIds.has(r.productId)) {
+      receiptOutletBySaleId.set(r.sale.id, r.sale.outletId);
+      receiptMetricsRevenue += revenue;
+    }
     const outletProductKey = `${r.sale.outletId}:${r.productId}`;
     outletProductQty.set(outletProductKey, (outletProductQty.get(outletProductKey) ?? 0) + qty);
     outletProductRevenue.set(outletProductKey, (outletProductRevenue.get(outletProductKey) ?? 0) + revenue);
@@ -552,7 +561,7 @@ export default async function PropertyAnalyticsPage({ params, searchParams }: Pr
   const totalOperating = totalGross - totalLabor - totalExpenses;
 
   const totalSalesCount = receiptOutletBySaleId.size;
-  const avgTicket = totalSalesCount > 0 ? totalRevenue / totalSalesCount : 0;
+  const avgTicket = totalSalesCount > 0 ? receiptMetricsRevenue / totalSalesCount : 0;
   const foodCostPct = pct(totalCogs, totalRevenue);
   const laborPct = pct(totalLabor, totalRevenue);
   const primeCostPct = pct(totalCogs + totalLabor, totalRevenue);
@@ -623,6 +632,7 @@ export default async function PropertyAnalyticsPage({ params, searchParams }: Pr
           outletCostMap,
           avgOutletCostByProduct,
           outletPriceMap,
+          excludedFromReceiptMetricsProductIds,
         })
       : undefined;
   const comparisonStatsB =
@@ -636,6 +646,7 @@ export default async function PropertyAnalyticsPage({ params, searchParams }: Pr
           outletCostMap,
           avgOutletCostByProduct,
           outletPriceMap,
+          excludedFromReceiptMetricsProductIds,
         })
       : undefined;
   const comparisonOutletALabel = outletStats.get(cmpBarA)?.name ?? "Bar A";
@@ -783,7 +794,7 @@ export default async function PropertyAnalyticsPage({ params, searchParams }: Pr
                 <Kpi title="Copertura inventari bar" value={percent(inventoryCoveragePct)} />
               </div>
               <div className="mt-3 text-xs text-zinc-500">
-                N. vendite e scontrino medio sono calcolati per scontrino/testata vendita, non per singola riga prodotto.
+                N. vendite e scontrino medio sono calcolati per scontrino/testata vendita. I prodotti marcati in “Prodotti” come esclusi dai KPI ticket non entrano in questi due indicatori ma restano inclusi nel resto delle analytics.
               </div>
             </div>
           </div>
@@ -1173,6 +1184,7 @@ function comparisonRows(
     cogs: number;
     labor: number;
     expenses?: number;
+    receiptMetricRevenue: number;
     salesCount: number;
   } | undefined,
   b: {
@@ -1180,6 +1192,7 @@ function comparisonRows(
     cogs: number;
     labor: number;
     expenses?: number;
+    receiptMetricRevenue: number;
     salesCount: number;
   } | undefined
 ) {
@@ -1187,8 +1200,8 @@ function comparisonRows(
   const bGross = (b?.revenue ?? 0) - (b?.cogs ?? 0);
   const aOp = aGross - (a?.labor ?? 0) - Number(a?.expenses ?? 0);
   const bOp = bGross - (b?.labor ?? 0) - Number(b?.expenses ?? 0);
-  const aAvgTicket = (a?.salesCount ?? 0) > 0 ? (a?.revenue ?? 0) / (a?.salesCount ?? 1) : 0;
-  const bAvgTicket = (b?.salesCount ?? 0) > 0 ? (b?.revenue ?? 0) / (b?.salesCount ?? 1) : 0;
+  const aAvgTicket = (a?.salesCount ?? 0) > 0 ? (a?.receiptMetricRevenue ?? 0) / (a?.salesCount ?? 1) : 0;
+  const bAvgTicket = (b?.salesCount ?? 0) > 0 ? (b?.receiptMetricRevenue ?? 0) / (b?.salesCount ?? 1) : 0;
   return [
     { label: "Ricavi netti", a: money(a?.revenue ?? 0), b: money(b?.revenue ?? 0) },
     { label: "COGS", a: money(a?.cogs ?? 0), b: money(b?.cogs ?? 0) },
@@ -1212,6 +1225,7 @@ type ComparisonOutletStats = {
   expenses: number;
   centralExpenses: number;
   inventoryCoveragePct: number;
+  receiptMetricRevenue: number;
   salesCount: number;
 };
 
@@ -1224,6 +1238,7 @@ async function buildComparisonOutletStats(args: {
   outletCostMap: Map<string, number>;
   avgOutletCostByProduct: Map<string, number>;
   outletPriceMap: Map<string, number>;
+  excludedFromReceiptMetricsProductIds: Set<string>;
 }): Promise<ComparisonOutletStats> {
   const month = clampMonth(args.month);
   const periodStart = new Date(Date.UTC(args.year, month - 1, 1, 0, 0, 0, 0));
@@ -1277,6 +1292,7 @@ async function buildComparisonOutletStats(args: {
   let revenue = 0;
   let cogs = 0;
   const receiptIds = new Set<string>();
+  let receiptMetricRevenue = 0;
   for (const r of saleRows) {
     const qty = Number(r.qty);
     const sellUnitPrice = grossToNetSaleUnitPrice(Number(r.unitPriceNet));
@@ -1286,9 +1302,12 @@ async function buildComparisonOutletStats(args: {
       avgCostByProduct.get(r.productId) ??
       0
     );
-    receiptIds.add(r.saleId);
     revenue += qty * sellUnitPrice;
     cogs += qty * unitCost;
+    if (!args.excludedFromReceiptMetricsProductIds.has(r.productId)) {
+      receiptIds.add(r.saleId);
+      receiptMetricRevenue += qty * sellUnitPrice;
+    }
   }
 
   const salesCount = receiptIds.size;
@@ -1342,7 +1361,7 @@ async function buildComparisonOutletStats(args: {
   });
   const inventoryCoveragePct = pct(new Set(inventoryRows.map((r) => r.outletId)).size, bars.length || 1);
 
-  return { revenue, cogs, labor, expenses, centralExpenses, inventoryCoveragePct, salesCount };
+  return { revenue, cogs, labor, expenses, centralExpenses, inventoryCoveragePct, receiptMetricRevenue, salesCount };
 }
 
 function operating(o: { revenue: number; cogs: number; labor: number; expenses?: number } | undefined) {

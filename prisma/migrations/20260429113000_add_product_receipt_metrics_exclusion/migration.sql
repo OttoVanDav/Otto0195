@@ -1,0 +1,2 @@
+ALTER TABLE "Product"
+ADD COLUMN IF NOT EXISTS "excludeFromAvgTicketAndSalesCount" BOOLEAN NOT NULL DEFAULT false;

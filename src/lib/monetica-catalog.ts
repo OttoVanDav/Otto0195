@@ -27,6 +27,7 @@ type MoneticaImportProduct = {
   priceCategory: string;
   defaultSalePriceNet: number;
   trackShrinkageBar: boolean;
+  excludeFromAvgTicketAndSalesCount: boolean;
   createdAt: Date;
 };
 
@@ -186,6 +187,7 @@ async function mergeProductIntoCanonical(args: {
         priceCategory: true,
         defaultSalePriceNet: true,
         trackShrinkageBar: true,
+        excludeFromAvgTicketAndSalesCount: true,
         createdAt: true,
       },
     });
@@ -199,6 +201,7 @@ async function mergeProductIntoCanonical(args: {
         priceCategory: true,
         defaultSalePriceNet: true,
         trackShrinkageBar: true,
+        excludeFromAvgTicketAndSalesCount: true,
         createdAt: true,
       },
     });
@@ -210,6 +213,7 @@ async function mergeProductIntoCanonical(args: {
       sku?: string;
       defaultSalePriceNet?: number;
       trackShrinkageBar?: boolean;
+      excludeFromAvgTicketAndSalesCount?: boolean;
     } = {};
 
     if (shouldUpdateMoneticaName(keepProduct.name, removeProduct.name)) {
@@ -223,6 +227,9 @@ async function mergeProductIntoCanonical(args: {
     }
     if (!keepProduct.trackShrinkageBar && removeProduct.trackShrinkageBar) {
       updateKeepData.trackShrinkageBar = true;
+    }
+    if (!keepProduct.excludeFromAvgTicketAndSalesCount && removeProduct.excludeFromAvgTicketAndSalesCount) {
+      updateKeepData.excludeFromAvgTicketAndSalesCount = true;
     }
 
     if (Object.keys(updateKeepData).length > 0) {
@@ -861,6 +868,7 @@ async function splitSharedMoneticaProducts(args: {
               ? article.price
               : 0,
           trackShrinkageBar: baseProduct.trackShrinkageBar,
+          excludeFromAvgTicketAndSalesCount: baseProduct.excludeFromAvgTicketAndSalesCount,
         },
         select: {
           id: true,
@@ -870,6 +878,7 @@ async function splitSharedMoneticaProducts(args: {
           priceCategory: true,
           defaultSalePriceNet: true,
           trackShrinkageBar: true,
+          excludeFromAvgTicketAndSalesCount: true,
           createdAt: true,
         },
       });
@@ -926,6 +935,7 @@ export async function importMoneticaArticlesIntoProperty(
       priceCategory: true,
       defaultSalePriceNet: true,
       trackShrinkageBar: true,
+      excludeFromAvgTicketAndSalesCount: true,
       createdAt: true,
     },
   });
@@ -1044,6 +1054,7 @@ export async function importMoneticaArticlesIntoProperty(
           priceCategory: "STANDARD",
           defaultSalePriceNet: year === currentUtcYear && price !== null ? price : 0,
           trackShrinkageBar: false,
+          excludeFromAvgTicketAndSalesCount: false,
         },
         select: {
           id: true,
@@ -1053,6 +1064,7 @@ export async function importMoneticaArticlesIntoProperty(
           priceCategory: true,
           defaultSalePriceNet: true,
           trackShrinkageBar: true,
+          excludeFromAvgTicketAndSalesCount: true,
           createdAt: true,
         },
       });
@@ -1084,12 +1096,13 @@ export async function importMoneticaArticlesIntoProperty(
             name: true,
             sku: true,
             uom: true,
-            priceCategory: true,
-            defaultSalePriceNet: true,
-            trackShrinkageBar: true,
-            createdAt: true,
-          },
-        });
+          priceCategory: true,
+          defaultSalePriceNet: true,
+          trackShrinkageBar: true,
+          excludeFromAvgTicketAndSalesCount: true,
+          createdAt: true,
+        },
+      });
         updatedProducts += 1;
         productById.set(product.id, product);
       }
@@ -1156,6 +1169,7 @@ export async function reconcileLocalMoneticaProducts(orgId: string) {
       priceCategory: true,
       defaultSalePriceNet: true,
       trackShrinkageBar: true,
+      excludeFromAvgTicketAndSalesCount: true,
       createdAt: true,
     },
   });
